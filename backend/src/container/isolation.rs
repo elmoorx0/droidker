@@ -46,6 +46,15 @@ pub struct IsolationSpec {
     pub runtime_bin: PathBuf,
     /// Extra args passed to the runtime binary (e.g. package name).
     pub runtime_args: Vec<String>,
+    /// Optional path to the host-side /dev/input/eventN node created by
+    /// InputInjector. When set, droidker-init bind-mounts it into the
+    /// container's /dev/input/event0 so Android's EventHub auto-detects
+    /// the virtual touchscreen. When None, no input device is exposed
+    /// and input injection API calls will create the injector lazily
+    /// (M5 behavior — touch events still work because the kernel routes
+    /// them via the host's uinput fd, but the container's own Android
+    /// InputReader cannot read them back).
+    pub input_event: Option<PathBuf>,
 }
 
 /// Result of preparing a sandbox.
@@ -119,6 +128,9 @@ impl Isolator {
         cmd.env("DROIDKER_ASHMEM_DEVICE", &spec.ashmem_device);
         cmd.env("DROIDKER_HOSTNAME", &spec.hostname);
         cmd.env("RUST_LOG", "info");
+        if let Some(p) = &spec.input_event {
+            cmd.env("DROIDKER_INPUT_EVENT", p);
+        }
 
         // Namespace flags. `unshare` accepts them as `-<flag>` short opts.
         cmd.args([

@@ -27,6 +27,11 @@
 //   DROIDKER_ANDROID_ROOTFS  — lowerdir (read-only Android system image)
 //   DROIDKER_BINDER_DEVICE   — host binder device node
 //   DROIDKER_ASHMEM_DEVICE   — host ashmem device node
+//   DROIDKER_INPUT_EVENT     — host /dev/input/eventN node created by
+//                              InputInjector (M5); bind-mounted into the
+//                              container so Android's EventHub picks it up
+//                              as the primary touchscreen. Optional: if
+//                              absent, no input device is exposed.
 //   DROIDKER_HOSTNAME        — hostname for the UTS namespace
 //   RUST_LOG                 — log level
 
@@ -83,7 +88,12 @@ fn run(container_id: &str, package: &str, apk_path: &str, apk_sha: &str) -> Resu
     mount_overlay(&android_rootfs, &upper, &work, &merged)?;
 
     // ---- 2. Bind-mount /dev nodes -----------------------------------------
-    setup_dev_nodes(&merged, &binder_device, &ashmem_device)?;
+    // The optional /dev/input/eventN node is created by the daemon's
+    // InputInjector before we exec. If present, it gets bind-mounted into
+    // the container's /dev/input/ so Android's EventHub auto-detects the
+    // virtual touchscreen on boot.
+    let input_event = std::env::var("DROIDKER_INPUT_EVENT").ok().map(PathBuf::from);
+    setup_dev_nodes(&merged, &binder_device, &ashmem_device, input_event.as_deref())?;
 
     // ---- 3. Mount fresh procfs + sysfs ------------------------------------
     setup_proc_and_sys(&merged)?;
@@ -172,6 +182,7 @@ fn setup_dev_nodes(
     merged: &Path,
     binder_device: &Path,
     ashmem_device: &Path,
+    input_event: Option<&Path>,
 ) -> Result<(), String> {
     let dev = merged.join("dev");
     std::fs::create_dir_all(&dev).map_err(|e| format!("mkdir dev: {e}"))?;
@@ -187,6 +198,44 @@ fn setup_dev_nodes(
         let dst = dev.join(name);
         if src.exists() {
             let _ = bind_mount(&src, &dst);
+        }
+    }
+
+    // /dev/input/eventN — bind-mount the host-side virtual touchscreen
+    // created by InputInjector. We expose it under the same path inside
+    // the container (/dev/input/event0) so Android's EventHub, which
+    // scans /dev/input/event*, picks it up automatically during the
+    // InputReader thread initialization.
+    //
+    // We deliberately expose only the touchscreen event node — NOT the
+    // whole /dev/input/ directory — so the container cannot read other
+    // host input devices (keyboard, mouse, host touchscreen).
+    if let Some(event_path) = input_event {
+        if event_path.exists() {
+            let input_dir = dev.join("input");
+            std::fs::create_dir_all(&input_dir)
+                .map_err(|e| format!("mkdir /dev/input: {e}"))?;
+            // Inside the container, always expose as event0 — Android's
+            // EventHub assigns the first detected touchscreen as the
+            // primary display input device.
+            let dst = input_dir.join("event0");
+            match bind_mount(event_path, &dst) {
+                Ok(()) => tracing::info!(
+                    src = %event_path.display(),
+                    dst = %dst.display(),
+                    "input event device bind-mounted"
+                ),
+                Err(e) => tracing::warn!(
+                    src = %event_path.display(),
+                    error = %e,
+                    "failed to bind-mount input event device (input injection will not work)"
+                ),
+            }
+        } else {
+            tracing::warn!(
+                path = %event_path.display(),
+                "DROIDKER_INPUT_EVENT points to nonexistent path; skipping bind-mount"
+            );
         }
     }
 

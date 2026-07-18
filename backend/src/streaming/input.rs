@@ -438,6 +438,24 @@ impl InputInjector {
         }
         None
     }
+
+    /// Like `find_event_path` but polls /sys/class/input for up to `timeout_ms`
+    /// waiting for the kernel to register the device. The kernel creates the
+    /// /dev/input/eventN node asynchronously after `UI_DEV_CREATE`, and on a
+    /// loaded 1-vCPU VPS this can take 50–200 ms. Without this retry loop
+    /// we'd race the bind-mount on every container start.
+    pub fn wait_for_event_path(&self, timeout_ms: u64) -> Option<std::path::PathBuf> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            if let Some(p) = self.find_event_path() {
+                return Some(p);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 }
 
 impl Drop for InputInjector {

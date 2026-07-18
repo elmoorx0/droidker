@@ -166,6 +166,42 @@ impl ContainerManager {
         let (runtime_bin, runtime_args) = runtime.build_invocation(&rt_spec)?;
 
         // --- Build isolation spec --------------------------------------------
+        // M5: create the InputInjector up-front so we can pass its eventN
+        // path to droidker-init, which bind-mounts it into the container's
+        // /dev/input/event0 before Android's EventHub scans for devices.
+        //
+        // We default to 540x960 (qHD) — the same resolution the screen
+        // streamer uses, so injected touches land on the right pixel
+        // coordinates the user sees in the browser.
+        let injector = crate::streaming::input::InputInjector::new(
+            snapshot.id,
+            540,
+            960,
+        )?;
+        // Wait up to 500 ms for the kernel to allocate /dev/input/eventN.
+        // On a 1-vCPU VPS under load this sometimes takes 100–200 ms.
+        let input_event = injector.wait_for_event_path(500);
+        // Stash the injector in the global registry so /screen/touch and
+        // /screen/key API calls find it without re-creating the uinput dev.
+        if let Some(path) = &input_event {
+            tracing::info!(
+                container_id = %snapshot.id,
+                event_path = %path.display(),
+                "virtual touchscreen registered"
+            );
+        } else {
+            tracing::warn!(
+                container_id = %snapshot.id,
+                "InputInjector created but no /dev/input/eventN node found yet; \
+                 input device will not be bind-mounted into the container"
+            );
+        }
+        let injector_arc = std::sync::Arc::new(tokio::sync::Mutex::new(injector));
+        {
+            let mut injectors = crate::api::screen::INJECTORS.lock().unwrap();
+            injectors.insert(snapshot.id, injector_arc);
+        }
+
         let iso_spec = IsolationSpec {
             container_id: snapshot.id,
             rootfs_overlay_dir: self.settings.data_dir.join("overlays"),
@@ -179,6 +215,7 @@ impl ContainerManager {
             hostname: format!("droidker-{}", &snapshot.id.to_string()[..8]),
             runtime_bin,
             runtime_args,
+            input_event: input_event.clone(),
         };
 
         // Apply namespace + cgroup isolation, returning the new PID.
