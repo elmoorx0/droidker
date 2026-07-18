@@ -13,6 +13,7 @@
 
 use crate::error::{DroidkerError, Result};
 use crate::humanizer::{self, GestureConfig, HumanizerEngine};
+use crate::streaming::audio::{self, AudioFormat};
 use crate::streaming::input::{InputInjector, KeyEvent, TouchEvent};
 use crate::streaming::server::upgrade as ws_upgrade;
 use crate::AppState;
@@ -39,7 +40,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .service(screen_info)
             .service(screen_human_tap)
             .service(screen_human_swipe)
-            .service(screen_human_longpress),
+            .service(screen_human_longpress)
+            .service(audio_ws),
     );
 }
 
@@ -347,6 +349,54 @@ fn seed_for(id: Uuid) -> u64 {
     // state must be nonzero, and UUIDs are random enough to guarantee that.
     let id_low = u64::from_be_bytes(id.as_bytes()[..8].try_into().unwrap_or([0u8; 8]));
     nanos ^ id_low
+}
+
+// ----- M5: audio streaming endpoint -----------------------------------------
+
+/// GET /api/v1/containers/{id}/audio/ws
+///
+/// Upgrade to a WebSocket. The server pushes raw PCM audio chunks
+/// (12-byte header + s16le samples). The browser decodes them with
+/// the Web Audio API. See `streaming/audio.rs` for the wire format.
+///
+/// Query parameters:
+///   sample_rate (default 8000) — 8000 | 16000 | 22050 | 44100
+///   channels    (default 1)    — 1 (mono) | 2 (stereo)
+#[get("/{id}/audio/ws")]
+async fn audio_ws(
+    req: HttpRequest,
+    payload: web::Payload,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+) -> Result<impl Responder> {
+    let key = path.into_inner();
+    let id = resolve_id(&state, &key)?;
+
+    let sample_rate = query
+        .get("sample_rate")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(8000)
+        .clamp(4000, 48000);
+    let channels = query
+        .get("channels")
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(1)
+        .clamp(1, 2);
+
+    let format = AudioFormat {
+        sample_rate,
+        channels,
+        bits_per_sample: 16,
+    };
+
+    tracing::info!(
+        container_id = %id,
+        format = ?format,
+        "audio WS upgrade requested"
+    );
+
+    audio::upgrade(req, payload, id, format).await
 }
 
 // GestureConfig needs Deserialize for the API request bodies.

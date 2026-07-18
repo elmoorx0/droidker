@@ -38,11 +38,13 @@
 //     would require knowing the binder transaction codes for the Android
 //     version on the host, which is fragile.
 
+pub mod audio;
 pub mod capture;
 pub mod encoder;
 pub mod input;
 pub mod server;
 
+pub use audio::{AudioCapturer, AudioFormat, AudioWs, AacEncoder};
 pub use capture::{CapturedFrame, FrameCapturer, CaptureSource};
 pub use encoder::JpegEncoder;
 pub use input::{InputInjector, TouchEvent, TouchPhase, KeyEvent, KeyCode};
