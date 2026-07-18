@@ -5,7 +5,7 @@
 > drives them with realistic human-like input.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Milestone](https://img.shields.io/badge/Milestone-4-orange)](https://github.com/droidker/droidker)
+[![Milestone](https://img.shields.io/badge/Milestone-5-orange)](https://github.com/elmoorx0/droidker)
 [![Backend: Rust](https://img.shields.io/badge/Backend-Rust-dea584)](https://www.rust-lang.org/)
 [![Frontend: SvelteKit](https://img.shields.io/badge/Frontend-SvelteKit-ff3e00)](https://kit.svelte.dev/)
 
@@ -175,6 +175,28 @@ droidker start my-app
 droidker rm my-app
 ```
 
+### Drive the container (M5 features)
+
+```bash
+# Raw touch — instant down+up, no humanization
+droidker tap my-app 270 480
+
+# Humanized tap — Bezier-jittered with Gaussian pressure
+droidker htap my-app 270 480
+
+# Humanized swipe — curved path with jittered timings
+droidker hswipe my-app 100 800 100 200
+
+# Humanized long-press — for context menus
+droidker hlongpress my-app 270 480 800
+
+# Take a single screenshot
+droidker screenshot my-app --out shot.jpg
+
+# Record a 30-second clip for CI artifacts
+droidker record my-app --duration 30 --fps 5 --quality 70 --out ci.mjpeg
+```
+
 ### Open the dashboard
 
 The SvelteKit dashboard runs on port 3000 by default. Start it in dev mode:
@@ -197,17 +219,27 @@ cd frontend && npm run build
 
 ## 🔌 REST API
 
-| Method   | Endpoint                          | Description                          |
-|----------|-----------------------------------|--------------------------------------|
-| `GET`    | `/api/v1/health`                  | Liveness probe                       |
-| `GET`    | `/api/v1/ready`                   | Readiness + loaded container count   |
-| `GET`    | `/api/v1/containers`              | List all containers                  |
-| `POST`   | `/api/v1/containers`              | Create a container                   |
-| `GET`    | `/api/v1/containers/{id}`         | Inspect a container                  |
-| `POST`   | `/api/v1/containers/{id}/start`   | Start a stopped container            |
-| `POST`   | `/api/v1/containers/{id}/stop`    | Stop a running container             |
-| `DELETE` | `/api/v1/containers/{id}`         | Delete a stopped container           |
-| `POST`   | `/api/v1/upload/apk`              | Upload an APK (multipart `file`)     |
+| Method   | Endpoint                                    | Description                          |
+|----------|---------------------------------------------|--------------------------------------|
+| `GET`    | `/api/v1/health`                            | Liveness probe                       |
+| `GET`    | `/api/v1/ready`                             | Readiness + loaded container count   |
+| `GET`    | `/api/v1/containers`                        | List all containers                  |
+| `POST`   | `/api/v1/containers`                        | Create a container                   |
+| `GET`    | `/api/v1/containers/{id}`                   | Inspect a container                  |
+| `POST`   | `/api/v1/containers/{id}/start`             | Start a stopped container            |
+| `POST`   | `/api/v1/containers/{id}/stop`              | Stop a running container             |
+| `DELETE` | `/api/v1/containers/{id}`                   | Delete a stopped container           |
+| `GET`    | `/api/v1/containers/{id}/logs/{kind}`       | Tail container logs (system/kernel)  |
+| `GET`    | `/api/v1/containers/{id}/stats`             | Live CPU/memory/IO stats             |
+| `POST`   | `/api/v1/containers/{id}/exec`              | Run a command in the sandbox (PTY)   |
+| `GET`    | `/api/v1/containers/{id}/screen/ws`         | WebSocket: JPEG screen stream        |
+| `POST`   | `/api/v1/containers/{id}/screen/touch`      | Inject a raw touch event             |
+| `POST`   | `/api/v1/containers/{id}/screen/key`        | Inject Home/Back/Recent key          |
+| `POST`   | `/api/v1/containers/{id}/screen/human/tap`       | Humanized tap (M5)              |
+| `POST`   | `/api/v1/containers/{id}/screen/human/swipe`     | Humanized Bezier swipe (M5)     |
+| `POST`   | `/api/v1/containers/{id}/screen/human/longpress` | Humanized long-press (M5)      |
+| `GET`    | `/api/v1/containers/{id}/audio/ws`          | WebSocket: raw PCM audio stream (M5) |
+| `POST`   | `/api/v1/upload/apk`                        | Upload an APK (multipart `file`)     |
 
 ---
 
@@ -220,8 +252,8 @@ cd frontend && npm run build
 | **M2.6**  | ✅      | Seccomp BPF install in PID 1 + per-arch syscall tables             |
 | **M3**    | ✅      | Per-container detail page, log streaming, `exec` into sandbox (PTY), port publishing |
 | **M4**    | ✅      | MJPEG screen streaming over WebSocket + uinput virtual touchscreen  |
-| **M5**    | 🔜     | Humanizer wiring (Bezier swipes → uinput) + bind-mount /dev/input  |
-| **M6**    | 🔜     | ARM → x86_64 translation (libhoudini / libndk integration)         |
+| **M5**    | ✅      | Humanizer wiring (Bezier+Gaussian → uinput), /dev/input bind-mount, audio WS, `droidker record` |
+| **M6**    | 🔜     | Opus audio, nsenter screenrecord, pinch-zoom, ARM → x86_64 translation |
 
 ---
 
