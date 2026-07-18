@@ -46,6 +46,14 @@ impl DroidkerClient {
         self.post_json("/api/v1/containers", body.clone()).await
     }
 
+    /// M7: inspect an already-uploaded APK to discover its native ABIs.
+    /// `filename` is the value returned by `upload_apk()` (typically
+    /// `<sha256>.apk`).
+    pub async fn inspect_apk(&self, filename: &str) -> Result<serde_json::Value> {
+        let body = json!({ "apk": filename });
+        self.post_json("/api/v1/apk/inspect", body).await
+    }
+
     pub async fn start_container(&self, id: &str) -> Result<serde_json::Value> {
         self.post_json(&format!("/api/v1/containers/{}/start", id), serde_json::Value::Null)
             .await

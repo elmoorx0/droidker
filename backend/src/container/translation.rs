@@ -397,6 +397,95 @@ pub fn build_translation_plan(
     (target, strategy)
 }
 
+/// Parse a user-supplied strategy override string (M7.2) into a
+/// `TranslationStrategy` value.
+///
+/// Accepted tokens (case-insensitive):
+///   * `native`           → Native (no translation)
+///   * `houdini`          → Houdini (with libhoudini.so probes)
+///   * `ndk_translation`  → NdkTranslation (with libndk_translation.so probes)
+///   * `qemu-user` | `qemu` → QemuUser (with qemu-<arch> probes)
+///
+/// Returns `Ok(Some(strategy))` if the token is recognized *and* the
+/// required files actually exist on the host. Returns `Ok(None)` if the
+/// token is empty / unrecognized (caller falls back to auto-resolve).
+/// Returns `Err` only for I/O / system errors during the probe.
+pub fn parse_strategy_override(token: &str) -> std::result::Result<Option<TranslationStrategy>, String> {
+    let t = token.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let s = match t.as_str() {
+        "native" => return Ok(Some(TranslationStrategy::Native)),
+        "houdini" | "libhoudini" => {
+            let lib64 = find_first(HOUDINI64_SEARCH_PATHS)
+                .ok_or_else(|| "houdini override requested but libhoudini64.so not found".to_string())?;
+            let lib32 = find_first(HOUDINI_SEARCH_PATHS);
+            TranslationStrategy::Houdini { lib64, lib32 }
+        }
+        "ndk_translation" | "ndk" | "libndk_translation" => {
+            let lib64 = find_first(NDK_TRANSLATION64_SEARCH_PATHS)
+                .ok_or_else(|| "ndk_translation override requested but libndk_translation64.so not found".to_string())?;
+            let lib32 = find_first(NDK_TRANSLATION_SEARCH_PATHS);
+            let gl64 = Path::new(NDK_TRANSLATION_GL64_PATH)
+                .exists()
+                .then(|| PathBuf::from(NDK_TRANSLATION_GL64_PATH));
+            TranslationStrategy::NdkTranslation { lib64, lib32, gl64 }
+        }
+        "qemu-user" | "qemu" | "qemu_user" => {
+            // For an override we don't know the target arch yet —
+            // default to arm64 (most common ARM APK target). The
+            // manager will re-probe with the actual target arch below
+            // if needed. We look for qemu-aarch64 first.
+            let bin = find_first(QEMU_AARCH64_PATHS)
+                .or_else(|| find_first(QEMU_ARM_PATHS))
+                .ok_or_else(|| "qemu-user override requested but qemu-aarch64/qemu-arm not found".to_string())?;
+            let argv0 = bin
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "qemu-user".to_string());
+            TranslationStrategy::QemuUser { bin, argv0 }
+        }
+        other => {
+            return Err(format!(
+                "unknown translation_strategy {:?} (expected: native, houdini, ndk_translation, qemu-user)",
+                other
+            ));
+        }
+    };
+    Ok(Some(s))
+}
+
+/// Like `build_translation_plan`, but applies an explicit strategy override
+/// first (M7.2). When the override is `None` or unrecognized, falls back
+/// to the standard auto-resolution path.
+pub fn build_translation_plan_with_override(
+    host: Arch,
+    requested_arch: Option<Arch>,
+    strategy_override: Option<&str>,
+) -> (Arch, TranslationStrategy) {
+    let target = requested_arch.unwrap_or(host);
+
+    if let Some(token) = strategy_override {
+        if !token.trim().is_empty() {
+            match parse_strategy_override(token) {
+                Ok(Some(s)) => return (target, s),
+                Ok(None) => { /* fall through to auto-resolve */ }
+                Err(e) => {
+                    tracing::warn!(
+                        token = %token,
+                        error = %e,
+                        "invalid translation_strategy override; falling back to auto-resolve"
+                    );
+                }
+            }
+        }
+    }
+
+    let strategy = resolve_strategy(host, target);
+    (target, strategy)
+}
+
 /// Concrete plan passed to `droidker-init` via `IsolationSpec`. This wraps
 /// the resolved target arch + strategy so the init binary doesn't have to
 /// re-probe the host.

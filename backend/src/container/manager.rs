@@ -130,6 +130,7 @@ impl ContainerManager {
             ports: req.ports,
             arch: arch.clone(),
             translation: None,
+            translation_strategy: req.translation_strategy,
             created_at: now,
             updated_at: now,
             notes: req.notes,
@@ -231,7 +232,11 @@ impl ContainerManager {
             ),
         };
         let (resolved_arch, strategy) =
-            crate::container::translation::build_translation_plan(host_arch, target_arch);
+            crate::container::translation::build_translation_plan_with_override(
+                host_arch,
+                target_arch,
+                snapshot.translation_strategy.as_deref(),
+            );
         tracing::info!(
             container_id = %snapshot.id,
             host_arch = %host_arch,

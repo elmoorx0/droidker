@@ -54,6 +54,37 @@ export interface UploadResult {
   original_name: string;
 }
 
+// ----- M6: translation capability types -----------------------------------
+
+export interface TranslationStrategySummary {
+  strategy: string;
+  usable: boolean;
+}
+
+export interface ReadyResponse {
+  ready: boolean;
+  data_dir: string;
+  containers_loaded: number;
+  host_arch: string;
+  translation: Record<string, TranslationStrategySummary>;
+}
+
+// ----- M7.1: APK inspection types -----------------------------------------
+
+export interface ApkAbiInfo {
+  abi: string;
+  so_count: number;
+  total_uncompressed_bytes: number;
+}
+
+export interface ApkInspectResult {
+  path: string;
+  zip_entry_count: number;
+  abis: ApkAbiInfo[];
+  has_no_native_libs: boolean;
+  recommended_arch: string | null;
+}
+
 const BASE = '/api/v1';
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
@@ -77,11 +108,7 @@ export const api = {
     return jsonFetch(`${BASE}/health`);
   },
 
-  async ready(): Promise<{
-    ready: boolean;
-    data_dir: string;
-    containers_loaded: number;
-  }> {
+  async ready(): Promise<ReadyResponse> {
     return jsonFetch(`${BASE}/ready`);
   },
 
@@ -204,6 +231,21 @@ export const api = {
       const form = new FormData();
       form.append('file', file);
       xhr.send(form);
+    });
+  },
+
+  // ----- M7.1: APK inspection ---------------------------------------------
+
+  /**
+   * Inspect an already-uploaded APK to discover its native ABIs.
+   * Used by the dashboard to show the recommended target arch before
+   * the user creates a container.
+   */
+  async inspectApk(filename: string): Promise<ApkInspectResult> {
+    return jsonFetch(`${BASE}/apk/inspect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apk: filename }),
     });
   },
 };

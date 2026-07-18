@@ -701,6 +701,13 @@ fn exec_app_process(package: &str) -> Result<(), String> {
     // For M2 we use the simpler `app_process` form that directly loads the
     // APK's main activity class. This requires the APK to declare an
     // explicit main class in its manifest, which most apps do.
+    //
+    // M7.3: when the translation strategy is `qemu-user`, we rewrite the
+    // exec target to `/system/bin/qemu-translation` (which was bind-mounted
+    // by `setup_translation_layer`) and prepend `app_process64` to argv so
+    // qemu interprets it. This is the only way to actually run ARM .so
+    // files under qemu-user — without the rewrite, app_process64 would
+    // exec natively and immediately SIGSEGV on the first ARM instruction.
 
     let app_process = Path::new("/system/bin/app_process64");
     if !app_process.exists() {
@@ -710,13 +717,93 @@ fn exec_app_process(package: &str) -> Result<(), String> {
         ));
     }
 
-    let app_process_c = CString::new(app_process.as_os_str().as_encoded_bytes())
+    // M7.3: detect qemu-user strategy. When active we exec qemu instead.
+    let strategy = std::env::var("DROIDKER_TRANSLATION_STRATEGY")
+        .unwrap_or_else(|_| "native".to_string());
+    let target_arch = std::env::var("DROIDKER_TARGET_ARCH")
+        .unwrap_or_else(|_| "x86_64".to_string());
+    let qemu_active = strategy == "qemu-user";
+
+    // Path to the qemu-user binary that `setup_translation_layer` bind-mounted
+    // into /system/bin/qemu-translation. When qemu is not active this is unused.
+    let qemu_bin = Path::new("/system/bin/qemu-translation");
+
+    // Verify the qemu binary is actually present when we plan to use it.
+    // If not, we log a fatal error but still fall through to the native
+    // app_process exec — that way the container at least starts (in a
+    // degraded mode) and the user sees an explanatory error in the logs.
+    let use_qemu = if qemu_active {
+        if qemu_bin.exists() {
+            true
+        } else {
+            tracing::error!(
+                bin = %qemu_bin.display(),
+                "qemu-user strategy selected but translator binary is missing; \
+                 falling back to native app_process (will crash on ARM .so loads)",
+            );
+            false
+        }
+    } else {
+        false
+    };
+
+    // ----- Build the exec target + argv ----------------------------------
+    //
+    // Native path:
+    //   execve("/system/bin/app_process64", ["app_process", "/system/bin",
+    //           "--nice-name", <package>, "android.app.ActivityThread"], envp)
+    //
+    // qemu-user path:
+    //   execve("/system/bin/qemu-translation",
+    //          ["qemu-<arch>", "/system/bin/app_process64", "app_process",
+    //           "/system/bin", "--nice-name", <package>,
+    //           "android.app.ActivityThread"], envp)
+    //
+    // qemu-user's argv[1] is the guest binary, argv[2..] are the guest's
+    // own argv[0..]. We pass `app_process` as the guest argv[0] so ART
+    // sees the same name it would under native execution.
+
+    let arg_app_process = CString::new("app_process").unwrap();
+    let arg_bin_dir = CString::new("/system/bin").unwrap();
+    let arg_nice_flag = CString::new("--nice-name").unwrap();
+    let arg_package = CString::new(package).unwrap();
+    let arg_activity = CString::new("android.app.ActivityThread").unwrap();
+
+    // For qemu-user: argv[0] is the qemu program name (cosmetic), argv[1]
+    // is the guest binary path, argv[2..] is the guest's argv[0..].
+    let arg_qemu_argv0 = CString::new(format!("qemu-{}", target_arch)).unwrap();
+    let arg_qemu_guest = CString::new(app_process.as_os_str().as_encoded_bytes())
         .map_err(|e| format!("CString: {e}"))?;
-    let arg0 = CString::new("app_process").unwrap();
-    let arg1 = CString::new("/system/bin").unwrap();
-    let arg2 = CString::new("--nice-name").unwrap();
-    let arg3 = CString::new(package).unwrap();
-    let arg4 = CString::new(format!("android.app.ActivityThread")).unwrap();
+
+    // Collect argv as a Vec so we can branch without duplicating the
+    // envp-building logic below.
+    let argv_ptrs: Vec<*const libc::c_char> = if use_qemu {
+        vec![
+            arg_qemu_argv0.as_ptr(),
+            arg_qemu_guest.as_ptr(),
+            arg_app_process.as_ptr(),
+            arg_bin_dir.as_ptr(),
+            arg_nice_flag.as_ptr(),
+            arg_package.as_ptr(),
+            arg_activity.as_ptr(),
+            std::ptr::null(),
+        ]
+    } else {
+        vec![
+            arg_app_process.as_ptr(),
+            arg_bin_dir.as_ptr(),
+            arg_nice_flag.as_ptr(),
+            arg_package.as_ptr(),
+            arg_activity.as_ptr(),
+            std::ptr::null(),
+        ]
+    };
+
+    // The actual binary we execve.
+    let exec_target = if use_qemu { qemu_bin } else { app_process };
+    let exec_target_c = CString::new(exec_target.as_os_str().as_encoded_bytes())
+        .map_err(|e| format!("CString: {e}"))?;
+
     let env_classpath = CString::new(
         "CLASSPATH=/system/framework/services.jar:/system/framework/framework.jar",
     ).unwrap();
@@ -741,15 +828,6 @@ fn exec_app_process(package: &str) -> Result<(), String> {
         })
         .collect();
 
-    let argv: [*const libc::c_char; 6] = [
-        arg0.as_ptr(),
-        arg1.as_ptr(),
-        arg2.as_ptr(),
-        arg3.as_ptr(),
-        arg4.as_ptr(),
-        std::ptr::null(),
-    ];
-
     // Build envp dynamically so we can append the translation envs.
     let mut envp: Vec<*const libc::c_char> = vec![
         env_bootclasspath.as_ptr(),
@@ -764,13 +842,15 @@ fn exec_app_process(package: &str) -> Result<(), String> {
     envp.push(std::ptr::null());
 
     tracing::info!(
-        strategy = %std::env::var("DROIDKER_TRANSLATION_STRATEGY").unwrap_or_default(),
-        target_arch = %std::env::var("DROIDKER_TARGET_ARCH").unwrap_or_default(),
+        strategy = %strategy,
+        target_arch = %target_arch,
+        use_qemu,
+        exec_target = %exec_target.display(),
         extra_envs = translation_envs.len(),
         "exec'ing app_process64"
     );
     let rc = unsafe {
-        libc::execve(app_process_c.as_ptr(), argv.as_ptr(), envp.as_ptr())
+        libc::execve(exec_target_c.as_ptr(), argv_ptrs.as_ptr(), envp.as_ptr())
     };
     Err(format!(
         "execve returned (rc={}): {}",
@@ -860,16 +940,23 @@ fn setup_translation_layer() -> Result<(), String> {
         );
     }
 
-    // 3. For qemu-user, no further setup is needed here — the actual
-    //    qemu exec is handled by `exec_app_process` (which we don't
-    //    override in this build; a future revision will add a qemu
-    //    branch to exec_app_process when strategy == "qemu-user").
+    // 3. For qemu-user, the actual exec rewrite happens in `exec_app_process`
+    //    (M7.3). We just sanity-check that the bind-mount succeeded above.
     if strategy == "qemu-user" {
-        tracing::warn!(
-            "qemu-user strategy selected but the qemu exec wrapper is not yet \
-             implemented in this build; app_process will start natively and \
-             fail when it tries to load ARM .so files"
-        );
+        let qemu_bin = Path::new("/system/bin/qemu-translation");
+        if !qemu_bin.exists() {
+            tracing::warn!(
+                bin = %qemu_bin.display(),
+                "qemu-user strategy selected but translator binary is missing; \
+                 exec_app_process will fall back to native app_process64 \
+                 (will crash on ARM .so loads)",
+            );
+        } else {
+            tracing::info!(
+                bin = %qemu_bin.display(),
+                "qemu-user strategy ready; exec_app_process will rewrite argv",
+            );
+        }
     }
 
     Ok(())

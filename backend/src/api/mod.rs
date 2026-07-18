@@ -5,6 +5,7 @@
 // All routes are mounted under `/api/v1/*` so we can ship breaking changes
 // under `/api/v2/*` later without touching existing clients (CLI, dashboard).
 
+pub mod apk;
 pub mod containers;
 pub mod exec;
 pub mod health;
@@ -23,6 +24,7 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
             .configure(upload::configure)
             .configure(stats::configure)
             .configure(logs::configure)
-            .configure(exec::configure),
+            .configure(exec::configure)
+            .configure(apk::configure),
     );
 }

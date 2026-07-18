@@ -5,7 +5,7 @@
 > drives them with realistic human-like input.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Milestone](https://img.shields.io/badge/Milestone-6-orange)](https://github.com/elmoorx0/droidker)
+[![Milestone](https://img.shields.io/badge/Milestone-7-orange)](https://github.com/elmoorx0/droidker)
 [![Backend: Rust](https://img.shields.io/badge/Backend-Rust-dea584)](https://www.rust-lang.org/)
 [![Frontend: SvelteKit](https://img.shields.io/badge/Frontend-SvelteKit-ff3e00)](https://kit.svelte.dev/)
 
@@ -222,7 +222,28 @@ droidker run ~/Downloads/com.example.arm64.apk --arch arm64
 # Run a 32-bit ARM APK
 droidker run ~/Downloads/com.example.arm.apk --arch arm
 
-# Inspect — Target arch + Translation are shown in the output
+# M7: let DroidKer inspect the APK and pick the arch automatically
+droidker run ~/Downloads/unknown-app.apk --arch auto
+# → • Uploading APK...
+#   • Inspecting APK native ABIs...
+#   • APK ships 2 ABI(s): arm64-v8a, armeabi-v7a; picked arm64
+#   • Creating container...
+
+# M7: inspect an uploaded APK without creating a container
+droidker upload ~/Downloads/foo.apk
+droidker inspect-apk abc123.apk
+# → APK native-ABI manifest
+#     file:           /var/lib/droidker/apks/abc123.apk
+#     zip entries:    142
+#     native libs:    found 2 ABI(s) shipped
+#       arm64-v8a           3 .so    4521984 bytes
+#       armeabi-v7a         3 .so    3102720 bytes
+#     recommended:    arm64 (use --arch <ARCH>)
+
+# M7: force a specific translator (e.g. qemu-user when libhoudini crashes)
+droidker run app.apk --arch arm64 --translation-strategy qemu-user
+
+# Inspect — Target arch + Translation + Strategy override are shown
 droidker inspect my-app
 ```
 
@@ -291,7 +312,8 @@ cd frontend && npm run build
 | **M4**    | ✅      | MJPEG screen streaming over WebSocket + uinput virtual touchscreen  |
 | **M5**    | ✅      | Humanizer wiring (Bezier+Gaussian → uinput), /dev/input bind-mount, audio WS, `droidker record` |
 | **M6**    | ✅      | ARM → x86_64 binary translation (libhoudini / libndk_translation / qemu-user), `--arch` flag, `install-translation.sh` |
-| **M7**    | 🔜     | Opus audio, nsenter screenrecord, pinch-zoom, dashboard translation panel, `--arch auto` |
+| **M7**    | ✅      | APK arch auto-detection (`--arch auto`), per-container `--translation-strategy` override, qemu-user exec wrapper, dashboard TranslationPanel |
+| **M8**    | 🔜     | Opus audio, nsenter screenrecord, pinch-zoom gestures, WebRTC screen option, APK signature verification, split-APK support |
 
 ---
 

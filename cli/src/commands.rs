@@ -80,6 +80,50 @@ pub async fn upload(client: &DroidkerClient, path: &Path, json: bool) -> Result<
     Ok(())
 }
 
+/// `droidker inspect-apk <filename>` (M7.1).
+///
+/// Calls `POST /api/v1/apk/inspect` and pretty-prints the result: which
+/// `lib/<abi>/*.so` directories the APK ships, how many `.so` files per
+/// ABI, total uncompressed bytes, and the recommended target arch.
+pub async fn inspect_apk(client: &DroidkerClient, apk: &str, json: bool) -> Result<()> {
+    let result = client.inspect_apk(apk).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    println!("{}", "APK native-ABI manifest".cyan().bold());
+    println!("  file:           {}", result["path"].as_str().unwrap_or("-"));
+    println!("  zip entries:    {}", result["zip_entry_count"].as_u64().unwrap_or(0));
+    let has_no_native = result["has_no_native_libs"].as_bool().unwrap_or(false);
+    if has_no_native {
+        println!(
+            "  native libs:    {} (pure-Java/Kotlin app; host arch is fine)",
+            "none".yellow()
+        );
+    } else {
+        println!("  native libs:    {} ABI(s) shipped", "found".green());
+    }
+    if let Some(abis) = result["abis"].as_array() {
+        for abi in abis {
+            let name = abi["abi"].as_str().unwrap_or("-");
+            let count = abi["so_count"].as_u64().unwrap_or(0);
+            let bytes = abi["total_uncompressed_bytes"].as_u64().unwrap_or(0);
+            println!(
+                "    {name:<16} {count:>3} .so   {bytes:>10} bytes",
+            );
+        }
+    }
+    if let Some(rec) = result["recommended_arch"].as_str() {
+        println!("  recommended:    {} ({})", rec.green(), "use --arch <ARCH>");
+    } else {
+        println!(
+            "  recommended:    {}",
+            "(none — use host arch)".yellow()
+        );
+    }
+    Ok(())
+}
+
 pub async fn run(
     client: &DroidkerClient,
     apk: &Path,
@@ -89,6 +133,7 @@ pub async fn run(
     notes: Option<String>,
     ports: &[String],
     arch: Option<String>,
+    translation_strategy: Option<String>,
     json: bool,
 ) -> Result<()> {
     // Step 1: upload the APK (the daemon dedups by SHA-256).
@@ -96,7 +141,52 @@ pub async fn run(
     let upload = client.upload_apk(apk).await?;
     let stored = upload["filename"].as_str().ok_or_else(|| anyhow!("missing filename in upload response"))?.to_string();
 
-    // Step 2: create the container.
+    // Step 2: resolve `--arch auto` by inspecting the uploaded APK's
+    // native-ABI manifest (M7.1). For an explicit `--arch <TOKEN>` we
+    // pass it through unchanged; for `None` we let the daemon default
+    // to the host arch.
+    let resolved_arch = if let Some(a) = arch.as_deref() {
+        if a.eq_ignore_ascii_case("auto") {
+            println!("{} Inspecting APK native ABIs...", "•".cyan());
+            let inspect = client.inspect_apk(&stored).await?;
+            let recommended = inspect["recommended_arch"]
+                .as_str()
+                .map(|s| s.to_string());
+            match recommended {
+                Some(picked) => {
+                    let abis = inspect["abis"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x["abi"].as_str().map(|s| s.to_string()))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    println!(
+                        "{} APK ships {} ABI(s): {}; picked {}",
+                        "•".cyan(),
+                        abis.len(),
+                        abis.join(", "),
+                        picked.green()
+                    );
+                    Some(picked)
+                }
+                None => {
+                    println!(
+                        "{} APK has no native libs (pure-Java); using host arch",
+                        "•".cyan()
+                    );
+                    None
+                }
+            }
+        } else {
+            Some(a.to_string())
+        }
+    } else {
+        None
+    };
+
+    // Step 3: create the container.
     println!("{} Creating container...", "•".cyan());
     let port_mappings = parse_ports(ports)?;
     let body = json!({
@@ -106,7 +196,8 @@ pub async fn run(
         "cpu_percent": cpu,
         "notes": notes,
         "ports": port_mappings,
-        "arch": arch,
+        "arch": resolved_arch,
+        "translation_strategy": translation_strategy,
     });
     let container = client.create_container(&body).await?;
     let id = container["id"]
@@ -114,7 +205,7 @@ pub async fn run(
         .ok_or_else(|| anyhow!("missing id in create response"))?
         .to_string();
 
-    // Step 3: start it.
+    // Step 4: start it.
     println!("{} Starting container...", "•".cyan());
     let started = client.start_container(&id).await?;
 
@@ -140,8 +231,21 @@ pub async fn create(
     notes: Option<String>,
     ports: &[String],
     arch: Option<String>,
+    translation_strategy: Option<String>,
     json: bool,
 ) -> Result<()> {
+    // `--arch auto` is not supported on `create` because the APK must
+    // already have been uploaded — but the user can still call
+    // `droidker inspect-apk <filename>` first and pass the result here.
+    if let Some(a) = arch.as_deref() {
+        if a.eq_ignore_ascii_case("auto") {
+            return Err(anyhow!(
+                "--arch auto is not supported on `create` (the APK must already \
+                 be uploaded). Use `droidker run --arch auto` instead, or run \
+                 `droidker inspect-apk <filename>` to pre-resolve the arch."
+            ));
+        }
+    }
     let port_mappings = parse_ports(ports)?;
     let body = json!({
         "name": name,
@@ -151,6 +255,7 @@ pub async fn create(
         "notes": notes,
         "ports": port_mappings,
         "arch": arch,
+        "translation_strategy": translation_strategy,
     });
     let c = client.create_container(&body).await?;
     if json {

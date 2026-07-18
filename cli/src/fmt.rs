@@ -110,6 +110,12 @@ pub fn print_container_detail(c: &Value) {
             "Translation",
             c["translation"].as_str().unwrap_or("-").to_string(),
         ),
+        // M7.2: per-container translation_strategy override (empty when
+        // the manager is auto-resolving).
+        (
+            "Strategy override",
+            c["translation_strategy"].as_str().unwrap_or("(auto)").to_string(),
+        ),
         (
             "Created",
             c["created_at"].as_str().unwrap_or("-").to_string(),

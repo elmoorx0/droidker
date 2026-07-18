@@ -15,6 +15,7 @@ use actix_web::{middleware, web, App, HttpServer};
 use std::sync::Arc;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+mod apk;
 mod api;
 mod config;
 mod container;

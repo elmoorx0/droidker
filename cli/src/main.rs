@@ -47,6 +47,16 @@ enum Cmd {
         path: PathBuf,
     },
 
+    /// Inspect an uploaded APK and list its native ABIs (M7).
+    ///
+    /// Shows which `lib/<abi>/*.so` directories the APK ships, the
+    /// number of `.so` files per ABI, the total uncompressed bytes,
+    /// and the recommended target arch for `droidker run --arch`.
+    InspectApk {
+        /// Filename of an already-uploaded APK (as returned by `upload`).
+        apk: String,
+    },
+
     /// Create + start a container from an uploaded APK in one step.
     /// Equivalent to `create` + `start`.
     Run {
@@ -75,12 +85,23 @@ enum Cmd {
         ports: Vec<String>,
 
         /// Target CPU architecture (M6). Accepted values: `arm`, `arm64`,
-        /// `x86`, `x86_64`. When omitted, the container runs on the host's
-        /// native arch (no translation). On an x86_64 host with libhoudini
-        /// or libndk_translation installed, `--arch arm64` lets ARM-only
-        /// APKs run via transparent binary translation.
+        /// `x86`, `x86_64`, or `auto` (M7). When omitted, the container
+        /// runs on the host's native arch (no translation). On an x86_64
+        /// host with libhoudini or libndk_translation installed,
+        /// `--arch arm64` lets ARM-only APKs run via transparent binary
+        /// translation. `--arch auto` (M7) uploads the APK, inspects its
+        /// `lib/<abi>/*.so` entries, and picks the best target arch
+        /// automatically.
         #[arg(long, value_name = "ARCH")]
         arch: Option<String>,
+
+        /// Translation strategy override (M7.2). Accepted values:
+        /// `houdini`, `ndk_translation`, `qemu-user`, `native`. When
+        /// omitted, the manager auto-resolves based on the host and the
+        /// requested `--arch`. Useful for apps that crash under
+        /// libhoudini but work under qemu-user.
+        #[arg(long, value_name = "STRATEGY")]
+        translation_strategy: Option<String>,
     },
 
     /// Create a container without starting it.
@@ -97,8 +118,13 @@ enum Cmd {
         #[arg(short = 'p', long = "port", value_name = "HOST:CONTAINER")]
         ports: Vec<String>,
         /// Target CPU architecture (M6). See `droidker run --arch`.
+        /// `auto` is not supported on `create` (the APK must already
+        /// have been uploaded); use `droidker run --arch auto` instead.
         #[arg(long, value_name = "ARCH")]
         arch: Option<String>,
+        /// Translation strategy override (M7.2). See `droidker run --translation-strategy`.
+        #[arg(long, value_name = "STRATEGY")]
+        translation_strategy: Option<String>,
     },
 
     /// Start a stopped container.
@@ -246,6 +272,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Info => commands::info(&client, output_json).await,
         Cmd::Ps => commands::ps(&client, output_json).await,
         Cmd::Upload { path } => commands::upload(&client, &path, output_json).await,
+        Cmd::InspectApk { apk } => commands::inspect_apk(&client, &apk, output_json).await,
         Cmd::Run {
             apk,
             name,
@@ -254,7 +281,20 @@ async fn main() -> anyhow::Result<()> {
             notes,
             ports,
             arch,
-        } => commands::run(&client, &apk, name, memory, cpu, notes, &ports, arch, output_json).await,
+            translation_strategy,
+        } => commands::run(
+            &client,
+            &apk,
+            name,
+            memory,
+            cpu,
+            notes,
+            &ports,
+            arch,
+            translation_strategy,
+            output_json,
+        )
+        .await,
         Cmd::Create {
             apk,
             name,
@@ -263,7 +303,20 @@ async fn main() -> anyhow::Result<()> {
             notes,
             ports,
             arch,
-        } => commands::create(&client, &apk, name, memory, cpu, notes, &ports, arch, output_json).await,
+            translation_strategy,
+        } => commands::create(
+            &client,
+            &apk,
+            name,
+            memory,
+            cpu,
+            notes,
+            &ports,
+            arch,
+            translation_strategy,
+            output_json,
+        )
+        .await,
         Cmd::Start { id_or_name } => commands::start(&client, &id_or_name, output_json).await,
         Cmd::Stop { id_or_name } => commands::stop(&client, &id_or_name, output_json).await,
         Cmd::Restart { id_or_name } => commands::restart(&client, &id_or_name, output_json).await,

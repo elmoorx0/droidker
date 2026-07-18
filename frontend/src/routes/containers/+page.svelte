@@ -1,6 +1,7 @@
 <script lang="ts">
   import { containers, refreshContainers } from '$lib/stores/containers';
   import ContainerCard from '$lib/components/ContainerCard.svelte';
+  import TranslationPanel from '$lib/components/TranslationPanel.svelte';
   import { goto } from '$app/navigation';
 
   let filter = '';
@@ -30,30 +31,39 @@
     <button class="btn-secondary text-xs" on:click={() => refreshContainers()}>Refresh</button>
   </div>
 
-  <div class="panel p-3 flex gap-3 items-center">
-    <input class="input" placeholder="Filter by name, package, or ID..." bind:value={filter} />
-    <select class="input w-40" bind:value={statusFilter}>
-      <option value="all">All states</option>
-      <option value="running">Running</option>
-      <option value="created">Created</option>
-      <option value="stopped">Stopped</option>
-      <option value="exited">Exited</option>
-    </select>
-  </div>
+  <div class="grid gap-4 lg:grid-cols-3">
+    <div class="lg:col-span-2 space-y-4">
+      <div class="panel p-3 flex gap-3 items-center">
+        <input class="input" placeholder="Filter by name, package, or ID..." bind:value={filter} />
+        <select class="input w-40" bind:value={statusFilter}>
+          <option value="all">All states</option>
+          <option value="running">Running</option>
+          <option value="created">Created</option>
+          <option value="stopped">Stopped</option>
+          <option value="exited">Exited</option>
+        </select>
+      </div>
 
-  {#if $containers.error}
-    <div class="text-sm text-droid-err bg-droid-err/10 border border-droid-err/30 rounded-md p-3">
-      {$containers.error}
+      {#if $containers.error}
+        <div class="text-sm text-droid-err bg-droid-err/10 border border-droid-err/30 rounded-md p-3">
+          {$containers.error}
+        </div>
+      {:else if filtered.length === 0}
+        <div class="panel p-8 text-center text-slate-500">
+          No containers match the filter.
+        </div>
+      {:else}
+        <div class="space-y-2">
+          {#each filtered as c (c.id)}
+            <ContainerCard container={c} onOpen={open} />
+          {/each}
+        </div>
+      {/if}
     </div>
-  {:else if filtered.length === 0}
-    <div class="panel p-8 text-center text-slate-500">
-      No containers match the filter.
+
+    <div class="space-y-4">
+      <TranslationPanel />
     </div>
-  {:else}
-    <div class="space-y-2">
-      {#each filtered as c (c.id)}
-        <ContainerCard container={c} onOpen={open} />
-      {/each}
-    </div>
-  {/if}
+  </div>
 </div>
+

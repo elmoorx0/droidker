@@ -83,6 +83,14 @@ pub struct Container {
     /// container has never been started.
     #[serde(default)]
     pub translation: Option<String>,
+    /// Per-container translation strategy override (M7.2). When set to
+    /// one of `houdini` | `ndk_translation` | `qemu-user` | `native`, the
+    /// manager uses this strategy verbatim instead of probing the host.
+    /// Useful for apps that crash under libhoudini but work fine under
+    /// qemu-user, or for reproducible benchmark runs. Empty / `None`
+    /// means "auto-resolve" (the M6 default).
+    #[serde(default)]
+    pub translation_strategy: Option<String>,
     /// Creation timestamp.
     pub created_at: DateTime<Utc>,
     /// Last state transition timestamp.
@@ -112,6 +120,8 @@ pub struct ContainerSummary {
     pub ip: Option<String>,
     pub arch: Option<String>,
     pub translation: Option<String>,
+    #[serde(default)]
+    pub translation_strategy: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -126,6 +136,7 @@ impl From<&Container> for ContainerSummary {
             ip: c.ip.clone(),
             arch: c.arch.clone(),
             translation: c.translation.clone(),
+            translation_strategy: c.translation_strategy.clone(),
             created_at: c.created_at,
         }
     }
@@ -153,6 +164,13 @@ pub struct CreateContainerRequest {
     /// on the host's native arch.
     #[serde(default)]
     pub arch: Option<String>,
+    /// Translation strategy override (M7.2). Accepted values:
+    /// `houdini`, `ndk_translation`, `qemu-user`, `native`. When omitted,
+    /// the manager auto-resolves the strategy based on the host and the
+    /// requested `arch`. Useful for apps that crash under libhoudini but
+    /// work fine under qemu-user.
+    #[serde(default)]
+    pub translation_strategy: Option<String>,
 }
 
 /// Payload for `POST /containers/{id}/humanize` — drives the Humanizer engine.
