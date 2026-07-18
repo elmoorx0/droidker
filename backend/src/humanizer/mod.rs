@@ -7,11 +7,20 @@
 //   - Gaussian jitter on timings (not uniform random)
 //   - Variable pressure values for realism
 //
-// Milestone 1 ships the public API and the math primitives. The actual
-// `/dev/input` write path lands in Milestone 3 once we have the runtime
-// booted (we need to know which eventX node corresponds to the container's
-// virtual touchscreen).
+// Architecture (M5 final):
+//   - `input.rs`    — math primitives (Bezier, Box-Muller, xorshift64 RNG).
+//   - `gestures.rs` — high-level tap/swipe/long_press that orchestrate
+//                     many events from the math layer to the kernel via
+//                     `InputInjector`.
+//
+// The daemon's API layer (`/api/v1/containers/{id}/screen/human/*`) calls
+// into `gestures.rs`; the kernel sees the resulting event stream on
+// /dev/uinput and relays it to the container's /dev/input/event0, where
+// Android's InputReader picks it up exactly as if a real finger had
+// touched the screen.
 
+pub mod gestures;
 pub mod input;
 
+pub use gestures::{tap, swipe, long_press, GestureConfig};
 pub use input::{HumanizerEngine, BezierPath, Point};

@@ -154,6 +154,36 @@ enum Cmd {
         key: String,
     },
 
+    /// Humanized tap (M5): Bezier-jittered down+up with Gaussian pressure.
+    /// Use this instead of `tap` when you want the gesture to look like a
+    /// real finger — bot detectors flag instant down+up pairs.
+    Htap {
+        id_or_name: String,
+        x: i32,
+        y: i32,
+    },
+
+    /// Humanized swipe (M5): curved Bezier path with Gaussian-jittered
+    /// inter-sample delays. Use this instead of `swipe` for automation
+    /// that needs to evade bot detection.
+    Hswipe {
+        id_or_name: String,
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+    },
+
+    /// Humanized long-press (M5): holds with small position drift so
+    /// Android's InputReader fires the long-press callback.
+    Hlongpress {
+        id_or_name: String,
+        x: i32,
+        y: i32,
+        /// Hold duration in milliseconds.
+        hold_ms: u32,
+    },
+
     /// Run a command inside a running container.
     Exec {
         id_or_name: String,
@@ -221,6 +251,20 @@ async fn main() -> anyhow::Result<()> {
             duration_ms,
         } => commands::swipe(&client, &id_or_name, x1, y1, x2, y2, duration_ms).await,
         Cmd::Key { id_or_name, key } => commands::key(&client, &id_or_name, &key).await,
+        Cmd::Htap { id_or_name, x, y } => commands::htap(&client, &id_or_name, x, y).await,
+        Cmd::Hswipe {
+            id_or_name,
+            x1,
+            y1,
+            x2,
+            y2,
+        } => commands::hswipe(&client, &id_or_name, x1, y1, x2, y2).await,
+        Cmd::Hlongpress {
+            id_or_name,
+            x,
+            y,
+            hold_ms,
+        } => commands::hlongpress(&client, &id_or_name, x, y, hold_ms).await,
         Cmd::Exec { id_or_name, cmd, cwd } => {
             commands::exec(&client, &id_or_name, &cmd, cwd.as_deref(), output_json).await
         }

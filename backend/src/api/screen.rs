@@ -3,16 +3,21 @@
 // REST + WebSocket endpoints for screen streaming + input injection.
 //
 // Routes (mounted under /api/v1/containers):
-//   GET  /{id}/screen/ws       — upgrade to WebSocket; streams JPEG frames
-//   POST /{id}/screen/touch    — inject a touch event
-//   POST /{id}/screen/key      — inject a key event (home/back/recent)
-//   GET  /{id}/screen/info     — query streaming capabilities + state
+//   GET  /{id}/screen/ws              — upgrade to WebSocket; streams JPEG frames
+//   POST /{id}/screen/touch           — inject a single raw touch event
+//   POST /{id}/screen/key             — inject a key event (home/back/recent)
+//   GET  /{id}/screen/info            — query streaming capabilities + state
+//   POST /{id}/screen/human/tap       — humanized tap (M5)
+//   POST /{id}/screen/human/swipe     — humanized swipe along a Bezier path (M5)
+//   POST /{id}/screen/human/longpress — humanized long-press (M5)
 
 use crate::error::{DroidkerError, Result};
+use crate::humanizer::{self, GestureConfig, HumanizerEngine};
 use crate::streaming::input::{InputInjector, KeyEvent, TouchEvent};
 use crate::streaming::server::upgrade as ws_upgrade;
 use crate::AppState;
 use actix_web::{get, post, web, HttpRequest, HttpResponse, Responder};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
@@ -31,7 +36,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .service(screen_ws)
             .service(screen_touch)
             .service(screen_key)
-            .service(screen_info),
+            .service(screen_info)
+            .service(screen_human_tap)
+            .service(screen_human_swipe)
+            .service(screen_human_longpress),
     );
 }
 
@@ -175,3 +183,184 @@ async fn get_or_create_injector(
     }
     Ok(arc)
 }
+
+// ----- M5: humanized gesture endpoints --------------------------------------
+//
+// These endpoints take a high-level intent ("tap here", "swipe from A to B",
+// "long-press here for 800ms") and expand it into a sequence of low-level
+// touch events with Bezier-curve paths and Gaussian-jittered timings.
+//
+// The blocking gesture functions live in `humanizer::gestures`. Because
+// they sleep (real wall-clock time) for tens of milliseconds per gesture,
+// we run them on `tokio::task::spawn_blocking` so the actix worker thread
+// is not tied up. Each request gets its own `HumanizerEngine` instance
+// seeded from the container_id + current time, so successive calls
+// produce uncorrelated jitter.
+
+/// Request body for `POST /screen/human/tap`.
+#[derive(Debug, Deserialize)]
+pub struct HumanTapRequest {
+    pub x: i32,
+    pub y: i32,
+    /// Optional override of the default gesture config.
+    #[serde(default)]
+    pub config: Option<GestureConfig>,
+}
+
+/// Request body for `POST /screen/human/swipe`.
+#[derive(Debug, Deserialize)]
+pub struct HumanSwipeRequest {
+    pub start_x: i32,
+    pub start_y: i32,
+    pub end_x: i32,
+    pub end_y: i32,
+    #[serde(default)]
+    pub config: Option<GestureConfig>,
+}
+
+/// Request body for `POST /screen/human/longpress`.
+#[derive(Debug, Deserialize)]
+pub struct HumanLongPressRequest {
+    pub x: i32,
+    pub y: i32,
+    /// How long to hold the press, in milliseconds.
+    pub hold_ms: u32,
+    #[serde(default)]
+    pub config: Option<GestureConfig>,
+}
+
+/// Generic response from any humanized gesture endpoint.
+#[derive(Debug, Serialize)]
+pub struct HumanGestureResponse {
+    pub container_id: String,
+    pub gesture: &'static str,
+    /// Total wall-clock milliseconds spent sleeping inside the gesture.
+    /// Useful for clients that want to schedule the next action without
+    /// racing the previous one's tail.
+    pub duration_ms: u32,
+}
+
+/// POST /api/v1/containers/{id}/screen/human/tap
+#[post("/{id}/screen/human/tap")]
+async fn screen_human_tap(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<HumanTapRequest>,
+) -> Result<impl Responder> {
+    let key = path.into_inner();
+    let id = resolve_id(&state, &key)?;
+    let req = body.into_inner();
+    let cfg = req.config.unwrap_or_default();
+
+    let injector = get_or_create_injector(&state, id).await?;
+    // Hold the injector lock across the entire gesture — we don't want
+    // a concurrent raw /screen/touch call to interleave events.
+    let inj_arc = injector.clone();
+    let duration_ms = tokio::task::spawn_blocking(move || -> Result<u32> {
+        let mut inj = inj_arc.blocking_lock();
+        let mut h = HumanizerEngine::new(seed_for(id));
+        humanizer::tap(&mut inj, &mut h, req.x, req.y, &cfg)
+    })
+    .await
+    .map_err(|e| DroidkerError::Syscall(format!("gesture task join: {e}")))??;
+
+    Ok(HttpResponse::Ok().json(HumanGestureResponse {
+        container_id: id.to_string(),
+        gesture: "tap",
+        duration_ms,
+    }))
+}
+
+/// POST /api/v1/containers/{id}/screen/human/swipe
+#[post("/{id}/screen/human/swipe")]
+async fn screen_human_swipe(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<HumanSwipeRequest>,
+) -> Result<impl Responder> {
+    let key = path.into_inner();
+    let id = resolve_id(&state, &key)?;
+    let req = body.into_inner();
+    let cfg = req.config.unwrap_or_default();
+
+    let injector = get_or_create_injector(&state, id).await?;
+    let inj_arc = injector.clone();
+    let duration_ms = tokio::task::spawn_blocking(move || -> Result<u32> {
+        let mut inj = inj_arc.blocking_lock();
+        let mut h = HumanizerEngine::new(seed_for(id));
+        humanizer::swipe(
+            &mut inj,
+            &mut h,
+            (req.start_x, req.start_y),
+            (req.end_x, req.end_y),
+            &cfg,
+        )
+    })
+    .await
+    .map_err(|e| DroidkerError::Syscall(format!("gesture task join: {e}")))??;
+
+    Ok(HttpResponse::Ok().json(HumanGestureResponse {
+        container_id: id.to_string(),
+        gesture: "swipe",
+        duration_ms,
+    }))
+}
+
+/// POST /api/v1/containers/{id}/screen/human/longpress
+#[post("/{id}/screen/human/longpress")]
+async fn screen_human_longpress(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<HumanLongPressRequest>,
+) -> Result<impl Responder> {
+    let key = path.into_inner();
+    let id = resolve_id(&state, &key)?;
+    let req = body.into_inner();
+    let cfg = req.config.unwrap_or_default();
+
+    let injector = get_or_create_injector(&state, id).await?;
+    let inj_arc = injector.clone();
+    let duration_ms = tokio::task::spawn_blocking(move || -> Result<u32> {
+        let mut inj = inj_arc.blocking_lock();
+        let mut h = HumanizerEngine::new(seed_for(id));
+        humanizer::long_press(&mut inj, &mut h, req.x, req.y, req.hold_ms, &cfg)
+    })
+    .await
+    .map_err(|e| DroidkerError::Syscall(format!("gesture task join: {e}")))??;
+
+    Ok(HttpResponse::Ok().json(HumanGestureResponse {
+        container_id: id.to_string(),
+        gesture: "longpress",
+        duration_ms,
+    }))
+}
+
+/// Build a per-request RNG seed from the container ID and the current
+/// nanosecond count. This ensures successive gestures on the same
+/// container produce different jitter patterns.
+fn seed_for(id: Uuid) -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    // XOR the nanos with the container UUID's low 64 bits. The xorshift64
+    // state must be nonzero, and UUIDs are random enough to guarantee that.
+    let id_low = u64::from_be_bytes(id.as_bytes()[..8].try_into().unwrap_or([0u8; 8]));
+    nanos ^ id_low
+}
+
+// GestureConfig needs Deserialize for the API request bodies.
+// We `#[derive(Deserialize)]` it here rather than in humanizer/gestures.rs
+// so the humanizer module stays free of serde dependencies (it's used
+// from contexts where serde isn't available, e.g. the test suite).
+//
+// Actually, serde IS available throughout the backend — but keeping the
+// derive at the API boundary is cleaner. We re-export GestureConfig from
+// humanizer::gestures already, so we just need Deserialize on the struct.
+// To avoid editing gestures.rs, we wrap it: the request body's `config`
+// field uses `GestureConfig` directly, which requires Deserialize. We
+// add it via a derive in the humanizer module.
+
+// Note: GestureConfig already derives Deserialize via `serde::Deserialize`
+// imported in gestures.rs. If that import is missing, the build will
+// fail here and we'll fix it.

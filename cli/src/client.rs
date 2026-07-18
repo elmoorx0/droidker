@@ -177,6 +177,56 @@ impl DroidkerClient {
         Ok(())
     }
 
+    /// POST /api/v1/containers/{id}/screen/human/tap — humanized tap (M5).
+    pub async fn human_tap(&self, id: &str, x: i32, y: i32) -> Result<serde_json::Value> {
+        let url = format!("{}/api/v1/containers/{}/screen/human/tap", self.base, id);
+        let body = json!({ "x": x, "y": y });
+        let resp = self.http.post(&url).json(&body).send().await?;
+        if !resp.status().is_success() {
+            let text = resp.text().await?;
+            return Err(anyhow!("human tap failed: {}", text));
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// POST /api/v1/containers/{id}/screen/human/swipe — humanized swipe (M5).
+    pub async fn human_swipe(
+        &self,
+        id: &str,
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+    ) -> Result<serde_json::Value> {
+        let url = format!("{}/api/v1/containers/{}/screen/human/swipe", self.base, id);
+        let body = json!({ "start_x": x1, "start_y": y1, "end_x": x2, "end_y": y2 });
+        let resp = self.http.post(&url).json(&body).send().await?;
+        if !resp.status().is_success() {
+            let text = resp.text().await?;
+            return Err(anyhow!("human swipe failed: {}", text));
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// POST /api/v1/containers/{id}/screen/human/longpress — humanized long-press (M5).
+    pub async fn human_long_press(
+        &self,
+        id: &str,
+        x: i32,
+        y: i32,
+        hold_ms: u32,
+    ) -> Result<serde_json::Value> {
+        let url =
+            format!("{}/api/v1/containers/{}/screen/human/longpress", self.base, id);
+        let body = json!({ "x": x, "y": y, "hold_ms": hold_ms });
+        let resp = self.http.post(&url).json(&body).send().await?;
+        if !resp.status().is_success() {
+            let text = resp.text().await?;
+            return Err(anyhow!("human longpress failed: {}", text));
+        }
+        Ok(resp.json().await?)
+    }
+
     /// Build a WebSocket URL by converting the HTTP base URL (http:// or
     /// https://) to ws:// or wss:// and appending the given path.
     pub fn ws_url(&self, path: &str) -> Result<String> {

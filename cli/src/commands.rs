@@ -402,3 +402,61 @@ pub async fn key(client: &DroidkerClient, id_or_name: &str, key: &str) -> Result
     println!("{} sent key {}", "✓".green(), normalized);
     Ok(())
 }
+
+/// Humanized tap (M5): Bezier-jittered down+up with Gaussian pressure.
+pub async fn htap(client: &DroidkerClient, id_or_name: &str, x: i32, y: i32) -> Result<()> {
+    let resp = client.human_tap(id_or_name, x, y).await?;
+    let dur = resp.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+    println!(
+        "{} humanized tap ({}, {}) — {}ms total",
+        "✓".green(),
+        x,
+        y,
+        dur
+    );
+    Ok(())
+}
+
+/// Humanized swipe (M5): curved Bezier path with Gaussian-jittered delays.
+pub async fn hswipe(
+    client: &DroidkerClient,
+    id_or_name: &str,
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+) -> Result<()> {
+    let resp = client.human_swipe(id_or_name, x1, y1, x2, y2).await?;
+    let dur = resp.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+    println!(
+        "{} humanized swipe ({}, {}) -> ({}, {}) — {}ms total",
+        "✓".green(),
+        x1,
+        y1,
+        x2,
+        y2,
+        dur
+    );
+    Ok(())
+}
+
+/// Humanized long-press (M5): holds with small position drift.
+pub async fn hlongpress(
+    client: &DroidkerClient,
+    id_or_name: &str,
+    x: i32,
+    y: i32,
+    hold_ms: u32,
+) -> Result<()> {
+    let resp = client.human_long_press(id_or_name, x, y, hold_ms).await?;
+    let dur = resp.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+    println!(
+        "{} humanized long-press ({}, {}) hold={}ms — {}ms total",
+        "✓".green(),
+        x,
+        y,
+        hold_ms,
+        dur
+    );
+    Ok(())
+}

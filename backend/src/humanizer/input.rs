@@ -104,7 +104,10 @@ impl HumanizerEngine {
         (duration_sec * 60.0).round() as u32
     }
 
-    fn next_uniform(&mut self) -> f64 {
+    /// Sample a uniform float in `[0, 1)`. Exposed so callers like the
+    /// gesture engine can derive their own distributions (e.g. signed
+    /// jitter) without re-implementing xorshift64.
+    pub fn next_uniform(&mut self) -> f64 {
         // xorshift64
         let mut x = self.rng_seed;
         x ^= x << 13;
@@ -113,6 +116,13 @@ impl HumanizerEngine {
         self.rng_seed = x;
         // Convert to [0,1)
         (x as f64) / (u64::MAX as f64)
+    }
+
+    /// Sample a uniform float in `[-1, 1)`. Convenience wrapper around
+    /// `next_uniform` for symmetric jitter (e.g. small position drift
+    /// during a long-press gesture).
+    pub fn next_signed(&mut self) -> f64 {
+        self.next_uniform() * 2.0 - 1.0
     }
 }
 
