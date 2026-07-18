@@ -22,6 +22,7 @@ use crate::config::Settings;
 use crate::container::cgroups::{Cgroup, CgroupLimits};
 use crate::container::network::{IpAllocator, NetHandle, NetworkConfigurator};
 use crate::container::rootfs;
+use crate::container::translation::TranslationPlan;
 use crate::error::{DroidkerError, Result};
 use std::ffi::CString;
 use std::os::unix::process::CommandExt;
@@ -55,6 +56,11 @@ pub struct IsolationSpec {
     /// them via the host's uinput fd, but the container's own Android
     /// InputReader cannot read them back).
     pub input_event: Option<PathBuf>,
+    /// M6: translation plan (target arch + strategy + bind-mounts + env
+    /// vars). Passed to droidker-init through the environment so it can
+    /// set up libhoudini / libndk_translation / qemu-user before exec'ing
+    /// app_process64.
+    pub translation: TranslationPlan,
 }
 
 /// Result of preparing a sandbox.
@@ -130,6 +136,13 @@ impl Isolator {
         cmd.env("RUST_LOG", "info");
         if let Some(p) = &spec.input_event {
             cmd.env("DROIDKER_INPUT_EVENT", p);
+        }
+        // M6: thread the translation plan (target arch + strategy + bind
+        // mounts + LD_PRELOAD) through to droidker-init via env vars. The
+        // init binary parses these after pivot_root and applies them just
+        // before exec'ing app_process64.
+        for (k, v) in spec.translation.env_vars() {
+            cmd.env(k, v);
         }
 
         // Namespace flags. `unshare` accepts them as `-<flag>` short opts.

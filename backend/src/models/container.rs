@@ -70,6 +70,19 @@ pub struct Container {
     /// need UDP from outside the sandbox.
     #[serde(default)]
     pub ports: Vec<PortMapping>,
+    /// Target CPU architecture for the container (M6). When `None`, the
+    /// container runs on the host's native arch (no translation). When set
+    /// to `arm` or `arm64` on an x86_64 host, DroidKer transparently
+    /// invokes the configured translator (libhoudini / libndk_translation
+    /// / qemu-user) so the APK's native `.so` libraries load correctly.
+    #[serde(default)]
+    pub arch: Option<String>,
+    /// Translation strategy that was *actually used* the last time the
+    /// container started. Populated by `ContainerManager::start` after the
+    /// strategy has been resolved from `arch` + the host. Empty when the
+    /// container has never been started.
+    #[serde(default)]
+    pub translation: Option<String>,
     /// Creation timestamp.
     pub created_at: DateTime<Utc>,
     /// Last state transition timestamp.
@@ -97,6 +110,8 @@ pub struct ContainerSummary {
     pub status: ContainerStatus,
     pub pid: u32,
     pub ip: Option<String>,
+    pub arch: Option<String>,
+    pub translation: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -109,6 +124,8 @@ impl From<&Container> for ContainerSummary {
             status: c.status,
             pid: c.pid,
             ip: c.ip.clone(),
+            arch: c.arch.clone(),
+            translation: c.translation.clone(),
             created_at: c.created_at,
         }
     }
@@ -131,6 +148,11 @@ pub struct CreateContainerRequest {
     /// via an iptables DNAT rule on the host. Defaults to none.
     #[serde(default)]
     pub ports: Vec<PortMapping>,
+    /// Target CPU architecture for this container (M6). Accepted values:
+    /// `arm`, `arm64`, `x86`, `x86_64`. When omitted, the container runs
+    /// on the host's native arch.
+    #[serde(default)]
+    pub arch: Option<String>,
 }
 
 /// Payload for `POST /containers/{id}/humanize` — drives the Humanizer engine.

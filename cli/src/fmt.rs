@@ -28,6 +28,7 @@ pub fn print_container_table(containers: &[Value]) {
             "NAME",
             "PACKAGE",
             "STATUS",
+            "ARCH",
             "PID",
             "IP",
             "CREATED",
@@ -50,11 +51,23 @@ pub fn print_container_table(containers: &[Value]) {
             .map(|d| d.with_timezone(&Utc).to_rfc3339())
             .unwrap_or_else(|| "-".to_string());
 
+        // M6: show arch + translation strategy as a combined cell like
+        // "arm64-v8a (libhoudini)". When translation is `native` or
+        // null we just show the arch.
+        let arch = c["arch"].as_str().unwrap_or("-");
+        let translation = c["translation"].as_str().unwrap_or("");
+        let arch_cell = match (arch, translation) {
+            ("-", _) => "-".to_string(),
+            (a, "native") | (a, "") => a.to_string(),
+            (a, t) => format!("{} ({})", a, t),
+        };
+
         table.add_row(Row::from(vec![
             Cell::new(short_id),
             Cell::new(c["name"].as_str().unwrap_or("-")),
             Cell::new(c["package"].as_str().unwrap_or("-")),
             Cell::new(status_colored),
+            Cell::new(arch_cell),
             Cell::new(c["pid"].as_u64().unwrap_or(0)),
             Cell::new(c["ip"].as_str().unwrap_or("-")),
             Cell::new(created),
@@ -87,6 +100,15 @@ pub fn print_container_detail(c: &Value) {
         (
             "APK SHA256",
             c["apk_sha256"].as_str().unwrap_or("-").to_string(),
+        ),
+        // M6: arch + translation strategy.
+        (
+            "Target arch",
+            c["arch"].as_str().unwrap_or("host-native").to_string(),
+        ),
+        (
+            "Translation",
+            c["translation"].as_str().unwrap_or("-").to_string(),
         ),
         (
             "Created",

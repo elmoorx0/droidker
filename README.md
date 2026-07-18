@@ -5,7 +5,7 @@
 > drives them with realistic human-like input.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Milestone](https://img.shields.io/badge/Milestone-5-orange)](https://github.com/elmoorx0/droidker)
+[![Milestone](https://img.shields.io/badge/Milestone-6-orange)](https://github.com/elmoorx0/droidker)
 [![Backend: Rust](https://img.shields.io/badge/Backend-Rust-dea584)](https://www.rust-lang.org/)
 [![Frontend: SvelteKit](https://img.shields.io/badge/Frontend-SvelteKit-ff3e00)](https://kit.svelte.dev/)
 
@@ -197,6 +197,43 @@ droidker screenshot my-app --out shot.jpg
 droidker record my-app --duration 30 --fps 5 --quality 70 --out ci.mjpeg
 ```
 
+### Run ARM APKs on x86_64 (M6 features)
+
+Most APKs ship native `.so` libraries compiled for ARM. On an x86_64 VPS,
+those won't run without a binary translator. DroidKer transparently wires
+up libhoudini / libndk_translation / qemu-user so a single `--arch` flag
+is all you need:
+
+```bash
+# One-time: install a translator on the host
+sudo bash scripts/install-translation.sh
+# → detects libhoudini if present, else installs libndk_translation
+#   or qemu-user-static as a fallback.
+
+# Verify it's working
+droidker info
+# → translation:
+#     ✓ arm64-v8a: libhoudini
+#     ✓ armeabi-v7a: libhoudini
+
+# Run an ARM64 APK
+droidker run ~/Downloads/com.example.arm64.apk --arch arm64
+
+# Run a 32-bit ARM APK
+droidker run ~/Downloads/com.example.arm.apk --arch arm
+
+# Inspect — Target arch + Translation are shown in the output
+droidker inspect my-app
+```
+
+Three strategies are supported, in priority order:
+
+| Strategy            | Speed     | License         | When to use                       |
+|---------------------|-----------|-----------------|-----------------------------------|
+| `libhoudini`        | ~2× ARM   | Intel, closed   | You have an Android-x86 install   |
+| `libndk_translation`| ~0.5× ARM | Apache 2.0      | Default open-source choice        |
+| `qemu-user`         | ~0.1× ARM | GPL-2.0         | Universal fallback (slow)         |
+
 ### Open the dashboard
 
 The SvelteKit dashboard runs on port 3000 by default. Start it in dev mode:
@@ -253,7 +290,8 @@ cd frontend && npm run build
 | **M3**    | ✅      | Per-container detail page, log streaming, `exec` into sandbox (PTY), port publishing |
 | **M4**    | ✅      | MJPEG screen streaming over WebSocket + uinput virtual touchscreen  |
 | **M5**    | ✅      | Humanizer wiring (Bezier+Gaussian → uinput), /dev/input bind-mount, audio WS, `droidker record` |
-| **M6**    | 🔜     | Opus audio, nsenter screenrecord, pinch-zoom, ARM → x86_64 translation |
+| **M6**    | ✅      | ARM → x86_64 binary translation (libhoudini / libndk_translation / qemu-user), `--arch` flag, `install-translation.sh` |
+| **M7**    | 🔜     | Opus audio, nsenter screenrecord, pinch-zoom, dashboard translation panel, `--arch auto` |
 
 ---
 

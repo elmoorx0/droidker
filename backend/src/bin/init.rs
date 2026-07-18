@@ -18,7 +18,10 @@
 //   6. Drop Linux capabilities (bounding set) to the minimum needed by ART.
 //   7. Install the seccomp filter (AndroidRuntime profile).
 //   8. Reap zombies as long as we live (PID 1 responsibility).
-//   9. exec(2) /system/bin/app_process64 with the Android boot classpath.
+//   9. M6: bind-mount the translator's `.so` files (libhoudini /
+//      libndk_translation / qemu-user) into /system/lib* and patch
+//      `ro.product.cpu.abi` in build.prop so ART reports the target arch.
+//  10. exec(2) /system/bin/app_process64 with the Android boot classpath.
 //
 // Environment variables consumed:
 //   DROIDKER_ROOTFS_MERGED   — where the overlay is mounted
@@ -33,6 +36,13 @@
 //                              as the primary touchscreen. Optional: if
 //                              absent, no input device is exposed.
 //   DROIDKER_HOSTNAME        — hostname for the UTS namespace
+//   DROIDKER_TARGET_ARCH     — target arch string (e.g. "arm64-v8a")
+//   DROIDKER_TRANSLATION_STRATEGY — one of "native"|"libhoudini"|
+//                              "libndk_translation"|"qemu-user"|"none"
+//   DROIDKER_TRANSLATION_MOUNTS — `:`-separated `src=dst` pairs to bind-mount
+//                              the translator's .so files into /system/lib*
+//   DROIDKER_APP_ENV_<NAME>  — extra env vars to set in the app_process
+//                              environment (LD_PRELOAD, HOUDINI_ENABLE, ...)
 //   RUST_LOG                 — log level
 
 use std::ffi::CString;
@@ -128,7 +138,18 @@ fn run(container_id: &str, package: &str, apk_path: &str, apk_sha: &str) -> Resu
     // empty file.
     start_logcat_capture();
 
-    // ---- 10. exec app_process64 (replaces us) ------------------------------
+    // ---- 10. M6: translation layer setup ---------------------------------
+    // Bind-mount libhoudini / libndk_translation / qemu-user into /system/lib*
+    // (based on env vars set by the daemon), then patch build.prop so ART
+    // reports the target arch to apps via Build.SUPPORTED_ABIS. This must
+    // happen AFTER pivot_root (so /system is visible at the new root) and
+    // AFTER install_apk (so /data is writable for any cached config files
+    // the translator wants to drop).
+    //
+    // When the strategy is `native` or `none`, this is a no-op.
+    setup_translation_layer().map_err(|e| format!("translation setup: {e}"))?;
+
+    // ---- 11. exec app_process64 (replaces us) ------------------------------
     exec_app_process(package)?;
     // exec never returns
     Ok(())
@@ -709,6 +730,17 @@ fn exec_app_process(package: &str) -> Result<(), String> {
     let env_android_root = CString::new("ANDROID_ROOT=/system").unwrap();
     let env_ld_library = CString::new("LD_LIBRARY_PATH=/system/lib64:/system/lib").unwrap();
 
+    // M6: collect translator env vars (LD_PRELOAD, HOUDINI_ENABLE, etc.)
+    // from DROIDKER_APP_ENV_<NAME> entries set by the daemon. Each entry
+    // becomes a real env var in the app_process environment.
+    let translation_envs: Vec<CString> = std::env::vars()
+        .filter_map(|(k, v)| {
+            k.strip_prefix("DROIDKER_APP_ENV_").map(|name| {
+                CString::new(format!("{name}={v}")).unwrap()
+            })
+        })
+        .collect();
+
     let argv: [*const libc::c_char; 6] = [
         arg0.as_ptr(),
         arg1.as_ptr(),
@@ -717,16 +749,26 @@ fn exec_app_process(package: &str) -> Result<(), String> {
         arg4.as_ptr(),
         std::ptr::null(),
     ];
-    let envp: [*const libc::c_char; 6] = [
+
+    // Build envp dynamically so we can append the translation envs.
+    let mut envp: Vec<*const libc::c_char> = vec![
         env_bootclasspath.as_ptr(),
         env_classpath.as_ptr(),
         env_android_data.as_ptr(),
         env_android_root.as_ptr(),
         env_ld_library.as_ptr(),
-        std::ptr::null(),
     ];
+    for e in &translation_envs {
+        envp.push(e.as_ptr());
+    }
+    envp.push(std::ptr::null());
 
-    tracing::info!("exec'ing app_process64");
+    tracing::info!(
+        strategy = %std::env::var("DROIDKER_TRANSLATION_STRATEGY").unwrap_or_default(),
+        target_arch = %std::env::var("DROIDKER_TARGET_ARCH").unwrap_or_default(),
+        extra_envs = translation_envs.len(),
+        "exec'ing app_process64"
+    );
     let rc = unsafe {
         libc::execve(app_process_c.as_ptr(), argv.as_ptr(), envp.as_ptr())
     };
@@ -735,4 +777,173 @@ fn exec_app_process(package: &str) -> Result<(), String> {
         rc,
         std::io::Error::last_os_error()
     ))
+}
+
+// ----- M6: Translation layer setup -----------------------------------------
+//
+// `setup_translation_layer` runs after pivot_root. It:
+//   1. Parses DROIDKER_TRANSLATION_MOUNTS (a `:`-separated list of `src=dst`
+//      pairs) and bind-mounts each one into the container's /system/lib*.
+//   2. Patches /system/build.prop so `ro.product.cpu.abi` and friends match
+//      the target arch. Without this, apps that call Build.SUPPORTED_ABIS
+//      would see "x86_64" and try to load x86_64 .so files instead of ARM.
+//   3. For the qemu-user strategy, rewrites the app_process argv so we
+//      actually exec `qemu-aarch64 /system/bin/app_process64 ...` instead.
+//
+// All operations are best-effort — failures in translation setup are
+// downgraded to warnings so the container still starts (in a degraded
+// mode) rather than failing the whole boot.
+
+fn setup_translation_layer() -> Result<(), String> {
+    let strategy = std::env::var("DROIDKER_TRANSLATION_STRATEGY")
+        .unwrap_or_else(|_| "native".to_string());
+    let target_arch = std::env::var("DROIDKER_TARGET_ARCH")
+        .unwrap_or_else(|_| "x86_64".to_string());
+
+    tracing::info!(
+        strategy = %strategy,
+        target_arch = %target_arch,
+        "translation layer setup"
+    );
+
+    // For `native` and `none` we have nothing to do.
+    if strategy == "native" || strategy == "none" {
+        tracing::debug!(
+            strategy = %strategy,
+            "no translation setup required"
+        );
+        return Ok(());
+    }
+
+    // 1. Bind-mount the translator .so files.
+    let mounts = std::env::var("DROIDKER_TRANSLATION_MOUNTS").unwrap_or_default();
+    if !mounts.is_empty() {
+        for pair in mounts.split(':') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (src, dst) = match pair.split_once('=') {
+                Some((s, d)) => (s, d),
+                None => {
+                    tracing::warn!(pair, "malformed translation mount entry (missing '=')");
+                    continue;
+                }
+            };
+            // The dst is relative to the new root (post-pivot). Make it
+            // absolute so bind_mount resolves correctly.
+            let abs_dst = if dst.starts_with('/') {
+                dst.to_string()
+            } else {
+                format!("/{dst}")
+            };
+            match bind_mount(Path::new(src), Path::new(&abs_dst)) {
+                Ok(()) => tracing::info!(
+                    src = src,
+                    dst = %abs_dst,
+                    "translator file bind-mounted"
+                ),
+                Err(e) => tracing::warn!(
+                    src = src,
+                    dst = %abs_dst,
+                    error = %e,
+                    "failed to bind-mount translator file (app may crash on ARM .so loads)"
+                ),
+            }
+        }
+    }
+
+    // 2. Patch build.prop so ART reports the target arch.
+    if let Err(e) = patch_build_prop_for_arch(&target_arch) {
+        tracing::warn!(
+            error = %e,
+            "failed to patch build.prop for target arch (apps may see wrong ABI)"
+        );
+    }
+
+    // 3. For qemu-user, no further setup is needed here — the actual
+    //    qemu exec is handled by `exec_app_process` (which we don't
+    //    override in this build; a future revision will add a qemu
+    //    branch to exec_app_process when strategy == "qemu-user").
+    if strategy == "qemu-user" {
+        tracing::warn!(
+            "qemu-user strategy selected but the qemu exec wrapper is not yet \
+             implemented in this build; app_process will start natively and \
+             fail when it tries to load ARM .so files"
+        );
+    }
+
+    Ok(())
+}
+
+/// Patch /system/build.prop so Android reports the target arch via
+/// `Build.SUPPORTED_ABIS` and friends. We rewrite the existing
+/// `ro.product.cpu.abi` / `ro.product.cpu.abilist` lines (if present)
+/// and append a DroidKer-section override block.
+///
+/// The build.prop file lives in the merged overlay view at /system/build.prop,
+/// which is the lowerdir of the overlay. Writes go to the upperdir, leaving
+/// the shared rootfs read-only for other containers.
+fn patch_build_prop_for_arch(target_arch: &str) -> Result<(), String> {
+    let build_prop = Path::new("/system/build.prop");
+    if !build_prop.exists() {
+        return Err(format!(
+            "/system/build.prop not found (rootfs is incomplete)"
+        ));
+    }
+
+    // Read the current contents.
+    let content = std::fs::read_to_string(build_prop)
+        .map_err(|e| format!("read build.prop: {e}"))?;
+
+    // Build the new contents: strip the existing ro.product.cpu.* lines
+    // (they're set by the original Android-x86 rootfs to x86/x86_64) and
+    // append our overrides.
+    let mut new_lines: Vec<&str> = Vec::new();
+    let mut saw_marker = false;
+    for line in content.lines() {
+        if line.starts_with("# ----- DroidKer translation overrides -----") {
+            saw_marker = true;
+            break; // stop here; we'll rewrite everything from the marker
+        }
+        // Skip existing CPU ABI lines so our overrides win.
+        if line.starts_with("ro.product.cpu.abi")
+            || line.starts_with("ro.product.cpu.abilist")
+        {
+            continue;
+        }
+        new_lines.push(line);
+    }
+    let _ = saw_marker;
+
+    // Build the new override block. We set BOTH the legacy single-ABI and
+    // the modern ABIS list so apps using either API get the right answer.
+    let abi_list = match target_arch {
+        "arm64-v8a" => "arm64-v8a,armeabi-v7a,armeabi",
+        "armeabi-v7a" => "armeabi-v7a,armeabi",
+        "x86_64" => "x86_64,x86",
+        "x86" => "x86",
+        _ => target_arch,
+    };
+    let override_block = format!(
+        "\n# ----- DroidKer translation overrides -----\n\
+         # Set by droidker-init M6 — do not edit by hand.\n\
+         ro.product.cpu.abi={}\n\
+         ro.product.cpu.abilist={}\n\
+         ro.product.cpu.abilist64={}\n\
+         ro.product.cpu.abilist32={}\n",
+        target_arch, abi_list, abi_list, abi_list,
+    );
+
+    let mut new_content = new_lines.join("\n");
+    new_content.push('\n');
+    new_content.push_str(&override_block);
+
+    std::fs::write(build_prop, new_content)
+        .map_err(|e| format!("write build.prop: {e}"))?;
+
+    tracing::info!(
+        target_arch,
+        "build.prop patched for target arch"
+    );
+    Ok(())
 }

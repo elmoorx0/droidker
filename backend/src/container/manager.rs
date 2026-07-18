@@ -102,6 +102,18 @@ impl ContainerManager {
             .trim_end_matches(".apk")
             .replace('_', ".");
 
+        // Validate the requested arch up-front so a typo doesn't waste a
+        // rootfs overlay directory. `None` is the default (host native).
+        let arch = match req.arch.as_deref() {
+            None => None,
+            Some(s) => Some(
+                crate::container::translation::Arch::parse(s)
+                    .map_err(|e| DroidkerError::BadRequest(e))?
+                    .as_str()
+                    .to_string(),
+            ),
+        };
+
         let now = Utc::now();
         let container = Container {
             id,
@@ -116,6 +128,8 @@ impl ContainerManager {
             ip: None,
             veth_host: None,
             ports: req.ports,
+            arch: arch.clone(),
+            translation: None,
             created_at: now,
             updated_at: now,
             notes: req.notes,
@@ -202,6 +216,39 @@ impl ContainerManager {
             injectors.insert(snapshot.id, injector_arc);
         }
 
+        // --- M6: resolve translation strategy --------------------------------
+        // Parse the container's `arch` field (if any) and probe the host for
+        // an available translator (libhoudini → libndk_translation → qemu-user
+        // → none). The resulting `TranslationStrategy` is threaded through
+        // `IsolationSpec` so droidker-init can bind-mount the translator's
+        // `.so` files and inject the right LD_PRELOAD.
+        let host_arch = crate::container::translation::Arch::detect_host();
+        let target_arch = match snapshot.arch.as_deref() {
+            None => None,
+            Some(s) => Some(
+                crate::container::translation::Arch::parse(s)
+                    .map_err(|e| DroidkerError::BadRequest(e))?,
+            ),
+        };
+        let (resolved_arch, strategy) =
+            crate::container::translation::build_translation_plan(host_arch, target_arch);
+        tracing::info!(
+            container_id = %snapshot.id,
+            host_arch = %host_arch,
+            target_arch = %resolved_arch,
+            strategy = strategy.as_str(),
+            "translation plan resolved"
+        );
+        let translation_plan = crate::container::translation::TranslationPlan {
+            target_arch: resolved_arch,
+            strategy,
+        };
+        // Snapshot the strategy string before we move `translation_plan`
+        // into `iso_spec` — we'll persist it into the container record
+        // after the sandbox has been prepared.
+        let strategy_str = translation_plan.strategy.as_str().to_string();
+        let target_arch_str = translation_plan.target_arch.as_str().to_string();
+
         let iso_spec = IsolationSpec {
             container_id: snapshot.id,
             rootfs_overlay_dir: self.settings.data_dir.join("overlays"),
@@ -216,6 +263,11 @@ impl ContainerManager {
             runtime_bin,
             runtime_args,
             input_event: input_event.clone(),
+            // M6: resolve translation strategy from the requested arch +
+            // the running host's arch. The resolved strategy + extra env
+            // vars are passed to droidker-init via the environment so it
+            // can bind-mount the translator's `.so` files before pivot_root.
+            translation: translation_plan,
         };
 
         // Apply namespace + cgroup isolation, returning the new PID.
@@ -235,6 +287,12 @@ impl ContainerManager {
             c.pid = pid;
             c.ip = Some(ip);
             c.veth_host = Some(veth_host);
+            // M6: persist the resolved arch + translation strategy so the
+            // CLI / dashboard can surface "running on x86_64 via libhoudini"
+            // info. Also overwrite `arch` if it was unset so future starts
+            // remember the host-native choice.
+            c.arch = Some(target_arch_str);
+            c.translation = Some(strategy_str);
             c.updated_at = Utc::now();
             c.clone()
         };

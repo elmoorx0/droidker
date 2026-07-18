@@ -29,6 +29,21 @@ pub async fn info(client: &DroidkerClient, json: bool) -> Result<()> {
         "  containers loaded: {}",
         ready["containers_loaded"]
     );
+    // M6: show host arch + translation capability.
+    if let Some(host_arch) = ready["host_arch"].as_str() {
+        println!("  host arch: {}", host_arch);
+    }
+    if let Some(t) = ready["translation"].as_object() {
+        if !t.is_empty() {
+            println!("  translation:");
+            for (abi, info) in t {
+                let strat = info["strategy"].as_str().unwrap_or("?");
+                let usable = info["usable"].as_bool().unwrap_or(false);
+                let marker = if usable { "✓".green() } else { "✗".red() };
+                println!("    {} {}: {}", marker, abi, strat);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -73,6 +88,7 @@ pub async fn run(
     cpu: Option<u32>,
     notes: Option<String>,
     ports: &[String],
+    arch: Option<String>,
     json: bool,
 ) -> Result<()> {
     // Step 1: upload the APK (the daemon dedups by SHA-256).
@@ -90,6 +106,7 @@ pub async fn run(
         "cpu_percent": cpu,
         "notes": notes,
         "ports": port_mappings,
+        "arch": arch,
     });
     let container = client.create_container(&body).await?;
     let id = container["id"]
@@ -122,6 +139,7 @@ pub async fn create(
     cpu: Option<u32>,
     notes: Option<String>,
     ports: &[String],
+    arch: Option<String>,
     json: bool,
 ) -> Result<()> {
     let port_mappings = parse_ports(ports)?;
@@ -132,6 +150,7 @@ pub async fn create(
         "cpu_percent": cpu,
         "notes": notes,
         "ports": port_mappings,
+        "arch": arch,
     });
     let c = client.create_container(&body).await?;
     if json {

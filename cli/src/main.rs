@@ -73,6 +73,14 @@ enum Cmd {
         /// Example: `-p 8080:80 -p 8443:443`.
         #[arg(short = 'p', long = "port", value_name = "HOST:CONTAINER")]
         ports: Vec<String>,
+
+        /// Target CPU architecture (M6). Accepted values: `arm`, `arm64`,
+        /// `x86`, `x86_64`. When omitted, the container runs on the host's
+        /// native arch (no translation). On an x86_64 host with libhoudini
+        /// or libndk_translation installed, `--arch arm64` lets ARM-only
+        /// APKs run via transparent binary translation.
+        #[arg(long, value_name = "ARCH")]
+        arch: Option<String>,
     },
 
     /// Create a container without starting it.
@@ -88,6 +96,9 @@ enum Cmd {
         notes: Option<String>,
         #[arg(short = 'p', long = "port", value_name = "HOST:CONTAINER")]
         ports: Vec<String>,
+        /// Target CPU architecture (M6). See `droidker run --arch`.
+        #[arg(long, value_name = "ARCH")]
+        arch: Option<String>,
     },
 
     /// Start a stopped container.
@@ -242,7 +253,8 @@ async fn main() -> anyhow::Result<()> {
             cpu,
             notes,
             ports,
-        } => commands::run(&client, &apk, name, memory, cpu, notes, &ports, output_json).await,
+            arch,
+        } => commands::run(&client, &apk, name, memory, cpu, notes, &ports, arch, output_json).await,
         Cmd::Create {
             apk,
             name,
@@ -250,7 +262,8 @@ async fn main() -> anyhow::Result<()> {
             cpu,
             notes,
             ports,
-        } => commands::create(&client, &apk, name, memory, cpu, notes, &ports, output_json).await,
+            arch,
+        } => commands::create(&client, &apk, name, memory, cpu, notes, &ports, arch, output_json).await,
         Cmd::Start { id_or_name } => commands::start(&client, &id_or_name, output_json).await,
         Cmd::Stop { id_or_name } => commands::stop(&client, &id_or_name, output_json).await,
         Cmd::Restart { id_or_name } => commands::restart(&client, &id_or_name, output_json).await,

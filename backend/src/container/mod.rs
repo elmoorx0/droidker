@@ -12,5 +12,6 @@ pub mod network;
 pub mod ports;
 pub mod rootfs;
 pub mod runtime;
+pub mod translation;
 
 pub use manager::ContainerManager;
