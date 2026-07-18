@@ -9,6 +9,7 @@ use anyhow::{anyhow, Result};
 use colored::Colorize;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
+use std::io::Write;
 use std::path::Path;
 
 pub async fn info(client: &DroidkerClient, json: bool) -> Result<()> {
@@ -457,6 +458,148 @@ pub async fn hlongpress(
         y,
         hold_ms,
         dur
+    );
+    Ok(())
+}
+
+/// Record a container's screen stream to an MJPEG file (M5).
+///
+/// The output file format is a simple concatenation:
+///   - 4-byte magic: b"MJP1" (MJPEG v1)
+///   - 4-byte LE: frame count
+///   - For each frame:
+///       4-byte LE: width
+///       4-byte LE: height
+///       4-byte LE: jpeg byte count
+///       4-byte LE: timestamp_ms since recording start
+///       N bytes: JPEG data
+///
+/// This is parseable by any tool that can read sequential binary; we
+/// picked a custom format over standard .avi/.mp4 to avoid pulling in
+/// ffmpeg as a native dependency. A 30-second recording at 5 FPS, q=70,
+/// 540x960 is ~3 MB.
+pub async fn record(
+    client: &DroidkerClient,
+    id_or_name: &str,
+    out: Option<&std::path::Path>,
+    duration_sec: u64,
+    fps: u32,
+    quality: u8,
+) -> Result<()> {
+    let c = client.get_container(id_or_name).await?;
+    let id = c["id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing id in container response"))?;
+
+    let fps = fps.clamp(1, 30);
+    let quality = quality.clamp(10, 95);
+
+    let out_path = match out {
+        Some(p) => p.to_path_buf(),
+        None => std::path::PathBuf::from(format!("{}-record.mjpeg", &id[..8])),
+    };
+
+    println!(
+        "{} recording {} for {}s at {}fps q={} -> {}",
+        "•".cyan(),
+        id,
+        duration_sec,
+        fps,
+        quality,
+        out_path.display()
+    );
+
+    let ws_url = client.ws_url(&format!("/api/v1/containers/{}/screen/ws", id))?;
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .map_err(|e| anyhow!("WS connect failed: {e}"))?;
+
+    use tokio_tungstenite::tungstenite::Message;
+
+    // Tell the server to send us frames at the requested fps + quality.
+    let set_fps = format!(r#"{{"type":"set_fps","fps":{}}}"#, fps);
+    let set_quality = format!(r#"{{"type":"set_quality","quality":{}}}"#, quality);
+    ws.send(Message::Text(set_fps.into())).await.ok();
+    ws.send(Message::Text(set_quality.into())).await.ok();
+
+    // Open the output file and write the header placeholder. We'll come
+    // back and patch the frame count when we're done.
+    let mut file = std::fs::File::create(&out_path)?;
+    file.write_all(b"MJP1")?;
+    // Placeholder frame count — we'll overwrite at the end.
+    file.write_all(&0u32.to_le_bytes())?;
+
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_secs(duration_sec);
+    let mut frame_count: u32 = 0;
+    let mut total_bytes: u64 = 0;
+
+    while std::time::Instant::now() < deadline {
+        let msg = tokio::time::timeout(
+            std::time::Duration::from_millis(2000),
+            ws.next(),
+        )
+        .await;
+        match msg {
+            Ok(Some(Ok(Message::Binary(buf)))) if buf.len() > 8 => {
+                let width = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let height = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                let jpeg = &buf[8..];
+                let ts_ms = start.elapsed().as_millis() as u32;
+
+                // Per-frame header.
+                file.write_all(&width.to_le_bytes())?;
+                file.write_all(&height.to_le_bytes())?;
+                file.write_all(&(jpeg.len() as u32).to_le_bytes())?;
+                file.write_all(&ts_ms.to_le_bytes())?;
+                file.write_all(jpeg)?;
+
+                frame_count += 1;
+                total_bytes += jpeg.len() as u64;
+
+                if frame_count % 5 == 0 {
+                    let elapsed = start.elapsed().as_secs();
+                    println!(
+                        "{}  captured {} frames ({}s / {}s, {} KB)",
+                        "•".cyan(),
+                        frame_count,
+                        elapsed,
+                        duration_sec,
+                        total_bytes / 1024
+                    );
+                }
+            }
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(e))) => {
+                return Err(anyhow!("WS error after {} frames: {}", frame_count, e))
+            }
+            Ok(None) => {
+                println!("{} WS closed by server after {} frames", "!".yellow(), frame_count);
+                break;
+            }
+            Err(_) => {
+                // Timeout — keep going until the deadline.
+                continue;
+            }
+        }
+    }
+
+    // Patch the frame count in the header.
+    use std::io::{Seek, Write};
+    file.seek(std::io::SeekFrom::Start(4))?;
+    file.write_all(&frame_count.to_le_bytes())?;
+    file.sync_all()?;
+
+    let elapsed = start.elapsed().as_secs();
+    let out_size = std::fs::metadata(&out_path)?.len();
+    println!(
+        "{} recorded {} frames in {}s ({} KB, avg {} KB/frame) -> {}",
+        "✓".green(),
+        frame_count,
+        elapsed,
+        out_size / 1024,
+        if frame_count > 0 { total_bytes / frame_count as u64 / 1024 } else { 0 },
+        out_path.display()
     );
     Ok(())
 }

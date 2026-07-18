@@ -184,6 +184,26 @@ enum Cmd {
         hold_ms: u32,
     },
 
+    /// Record a container's screen stream to an MJPEG file (M5).
+    /// Useful for CI artifacts — drop a recording into your test report
+    /// so reviewers can see exactly what the test saw.
+    Record {
+        id_or_name: String,
+        /// Output file path. Default: <id>-record.mjpeg
+        #[arg(short = 'o', long)]
+        out: Option<PathBuf>,
+        /// Recording duration in seconds. Default: 10.
+        #[arg(short = 'd', long, default_value = "10")]
+        duration: u64,
+        /// Frames per second to capture (1..=30). Default: 5 — low enough
+        /// for CI but high enough to catch UI flicker.
+        #[arg(short = 'f', long, default_value = "5")]
+        fps: u32,
+        /// JPEG quality (10..=95). Default: 70.
+        #[arg(short = 'q', long, default_value = "70")]
+        quality: u8,
+    },
+
     /// Run a command inside a running container.
     Exec {
         id_or_name: String,
@@ -265,6 +285,23 @@ async fn main() -> anyhow::Result<()> {
             y,
             hold_ms,
         } => commands::hlongpress(&client, &id_or_name, x, y, hold_ms).await,
+        Cmd::Record {
+            id_or_name,
+            out,
+            duration,
+            fps,
+            quality,
+        } => {
+            commands::record(
+                &client,
+                &id_or_name,
+                out.as_deref(),
+                duration,
+                fps,
+                quality,
+            )
+            .await
+        }
         Cmd::Exec { id_or_name, cmd, cwd } => {
             commands::exec(&client, &id_or_name, &cmd, cwd.as_deref(), output_json).await
         }
