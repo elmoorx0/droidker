@@ -1,0 +1,81 @@
+# droidkerd.service — systemd unit for the DroidKer backend daemon.
+#
+# Install to: /etc/systemd/system/droidkerd.service
+# Enable with:  sudo systemctl enable --now droidkerd
+#
+# Logs:          journalctl -u droidkerd -f
+# Status:        systemctl status droidkerd
+
+[Unit]
+Description=DroidKer Backend Daemon (Android APK micro-container runtime)
+Documentation=https://github.com/droidker/droidker
+After=network-online.target
+Wants=network-online.target
+
+# We require:
+#   - cgroup v2 mounted at /sys/fs/cgroup
+#   - /dev/binder + /dev/ashmem device nodes
+#   - The droidker0 bridge configured
+# Those are set up by scripts/setup.sh, which runs before this service
+# in the boot sequence (it's a one-shot that creates a dracut-style
+# "first-boot" marker file).
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# Environment overrides (also configurable via /etc/droidker/config.toml).
+Environment="RUST_LOG=info,droidker_backend=debug"
+Environment="DROIDKER_HOST=0.0.0.0"
+Environment="DROIDKER_PORT=8080"
+Environment="DROIDKER__DATA_DIR=/var/lib/droidker"
+Environment="DROIDKER__ANDROID_ROOTFS=/opt/droidker/android-rootfs"
+
+# Root is required because we use:
+#   - clone(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET | ...) via unshare
+#   - cgroup v2 writes to /sys/fs/cgroup/droidker/*
+#   - iptables/ip commands for veth pair setup
+# Dropping privileges happens *inside* the container after pivot_root.
+
+# CAP_NET_ADMIN + CAP_SYS_ADMIN + CAP_NET_BIND_SERVICE would be enough on
+# a host with user namespaces, but on a 1-GB VPS we typically run as full
+# root to avoid the uidmap allocation overhead.
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SETGID CAP_SETUID
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SETGID CAP_SETUID
+
+# Resource limits — keep the daemon itself tiny so the containers can use
+# the bulk of the 1 GB VPS.
+MemoryMax=256M
+MemoryHigh=200M
+CPUWeight=500
+TasksMax=512
+LimitNOFILE=4096
+
+# Restart policy: bounce on crash, but not in a tight loop.
+Restart=on-failure
+RestartSec=2
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Working directory.
+WorkingDirectory=/var/lib/droidker
+
+# Executable.
+ExecStart=/usr/local/bin/droidkerd
+
+# Standard IO — captured by journald.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=droidkerd
+
+# Hardening that doesn't break us:
+NoNewPrivileges=false
+ProtectSystem=false
+ProtectHome=false
+PrivateTmp=true
+PrivateDevices=false
+# (We need access to /dev/binder, /dev/ashmem, /dev/net/tun, etc.)
+
+[Install]
+WantedBy=multi-user.target

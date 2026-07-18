@@ -1,0 +1,37 @@
+[package]
+name = "droidker-cli"
+version = "0.1.0"
+edition = "2021"
+authors = ["DroidKer Team"]
+description = "Command-line interface for the DroidKer Android micro-container platform"
+license = "MIT"
+
+[[bin]]
+name = "droidker"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json", "multipart", "stream"] }
+tokio = { version = "1.36", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+comfy-table = "7.1"
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.7", features = ["serde"] }
+colored = "2.1"
+
+# WebSocket client for `droidker screenshot` — we connect to the screen
+# stream, grab the first frame, then disconnect.
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

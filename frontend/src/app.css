@@ -1,0 +1,74 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body {
+    @apply h-full bg-droid-bg text-slate-200 font-sans antialiased;
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-droid-bg;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-droid-border rounded-full;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-slate-600;
+  }
+}
+
+@layer components {
+  .panel {
+    @apply bg-droid-panel border border-droid-border rounded-lg;
+  }
+
+  .btn {
+    @apply inline-flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium
+           transition-colors focus:outline-none focus:ring-2 focus:ring-droid-accent/50;
+  }
+  .btn-primary {
+    @apply btn bg-droid-accent text-slate-900 hover:bg-cyan-400;
+  }
+  .btn-secondary {
+    @apply btn bg-droid-border text-slate-200 hover:bg-slate-700;
+  }
+  .btn-danger {
+    @apply btn bg-droid-err/90 text-white hover:bg-droid-err;
+  }
+  .btn-ghost {
+    @apply btn text-slate-400 hover:text-slate-200 hover:bg-droid-border;
+  }
+
+  .badge {
+    @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-mono uppercase tracking-wider;
+  }
+  .badge-running {
+    @apply badge bg-droid-ok/20 text-droid-ok;
+  }
+  .badge-stopped {
+    @apply badge bg-droid-err/20 text-droid-err;
+  }
+  .badge-created {
+    @apply badge bg-droid-warn/20 text-droid-warn;
+  }
+  .badge-paused {
+    @apply badge bg-droid-accent-2/20 text-droid-accent-2;
+  }
+  .badge-other {
+    @apply badge bg-slate-700/40 text-slate-400;
+  }
+
+  .input {
+    @apply w-full bg-droid-bg border border-droid-border rounded-md px-3 py-2 text-sm
+           focus:outline-none focus:ring-2 focus:ring-droid-accent/50 placeholder:text-slate-600;
+  }
+  .label {
+    @apply block text-xs font-medium text-slate-400 mb-1 uppercase tracking-wider;
+  }
+}
