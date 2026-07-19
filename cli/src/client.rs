@@ -54,6 +54,33 @@ impl DroidkerClient {
         self.post_json("/api/v1/apk/inspect", body).await
     }
 
+    /// POST /api/v1/apk/verify — verify an APK's signature (M8.1).
+    ///
+    /// Returns the signature scheme (`v1` / `v2` / `v3` / `none`), the
+    /// signer cert SHA-256 fingerprint (when v2/v3 is present), and
+    /// the best-effort cert subject DN.
+    pub async fn verify_apk(&self, filename: &str) -> Result<serde_json::Value> {
+        let body = json!({ "apk": filename });
+        self.post_json("/api/v1/apk/verify", body).await
+    }
+
+    /// POST /api/v1/apk/bundle — inspect a split-APK bundle (M8.2).
+    ///
+    /// `arch` is optional; when supplied, the response includes a
+    /// `recommended_install` field listing which inner APKs to install
+    /// for that target arch.
+    pub async fn inspect_bundle(
+        &self,
+        filename: &str,
+        arch: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let body = match arch {
+            Some(a) => json!({ "apk": filename, "arch": a }),
+            None => json!({ "apk": filename }),
+        };
+        self.post_json("/api/v1/apk/bundle", body).await
+    }
+
     pub async fn start_container(&self, id: &str) -> Result<serde_json::Value> {
         self.post_json(&format!("/api/v1/containers/{}/start", id), serde_json::Value::Null)
             .await
@@ -231,6 +258,36 @@ impl DroidkerClient {
         if !resp.status().is_success() {
             let text = resp.text().await?;
             return Err(anyhow!("human longpress failed: {}", text));
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// POST /api/v1/containers/{id}/screen/human/pinch — pinch-zoom (M8.4).
+    ///
+    /// Performs a two-finger pinch gesture. When `end_distance >
+    /// start_distance`, it's a zoom-in; otherwise zoom-out.
+    pub async fn human_pinch(
+        &self,
+        id: &str,
+        center_x: i32,
+        center_y: i32,
+        start_distance: f64,
+        end_distance: f64,
+        angle_deg: f64,
+    ) -> Result<serde_json::Value> {
+        let url =
+            format!("{}/api/v1/containers/{}/screen/human/pinch", self.base, id);
+        let body = json!({
+            "center_x": center_x,
+            "center_y": center_y,
+            "start_distance": start_distance,
+            "end_distance": end_distance,
+            "angle_deg": angle_deg,
+        });
+        let resp = self.http.post(&url).json(&body).send().await?;
+        if !resp.status().is_success() {
+            let text = resp.text().await?;
+            return Err(anyhow!("human pinch failed: {}", text));
         }
         Ok(resp.json().await?)
     }

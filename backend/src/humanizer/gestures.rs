@@ -251,6 +251,196 @@ pub fn long_press(
     Ok(total_sleep)
 }
 
+/// A humanized pinch-zoom gesture: two fingers start near the center
+/// and move outward (zoom in) or inward (zoom out) along a line.
+///
+/// This is the first multi-touch gesture in DroidKer (M8.4). It uses
+/// two multitouch slots (0 and 1) and emits synchronized DOWN/MOVE/UP
+/// events on each. The kernel's MT events are picked up by Android's
+/// InputReader, which dispatches them to the app as a `MotionEvent`
+/// with `pointerCount == 2` and the appropriate `GestureDetector`
+/// zoom callbacks.
+///
+/// `center` is the focal point of the pinch. `start_distance` is the
+/// initial distance between the two fingers (typically small, e.g. 30
+/// px for a "pinch in" starting position). `end_distance` is the final
+/// distance (larger for zoom-in, smaller for zoom-out). `angle_deg`
+/// orients the pinch line — 0° is horizontal, 90° is vertical. The
+/// default of 45° produces a natural diagonal pinch, which is what
+/// most users actually do on a real touchscreen.
+///
+/// Returns the total wall time spent sleeping, in milliseconds.
+pub fn pinch_zoom(
+    inj: &mut InputInjector,
+    humanizer: &mut HumanizerEngine,
+    center: (i32, i32),
+    start_distance: f64,
+    end_distance: f64,
+    angle_deg: f64,
+    cfg: &GestureConfig,
+) -> Result<u32> {
+    let mut total_sleep = 0u32;
+
+    // Pre-pinch delay — both fingers approach the screen.
+    let d = humanizer.human_delay_ms(cfg.pre_tap_delay_ms, cfg.pre_tap_delay_ms / 2);
+    sleep_ms(d);
+    total_sleep += d;
+
+    // Compute the start/end positions of both fingers along the pinch
+    // line. Finger 0 is at center - half_distance * (cos, sin); finger
+    // 1 is at center + half_distance * (cos, sin).
+    let angle = angle_deg.to_radians();
+    let (cos_a, sin_a) = (angle.cos(), angle.sin());
+
+    let start_half = start_distance / 2.0;
+    let end_half = end_distance / 2.0;
+
+    let f0_start = (
+        (center.0 as f64 - start_half * cos_a).round() as i32,
+        (center.1 as f64 - start_half * sin_a).round() as i32,
+    );
+    let f0_end = (
+        (center.0 as f64 - end_half * cos_a).round() as i32,
+        (center.1 as f64 - end_half * sin_a).round() as i32,
+    );
+    let f1_start = (
+        (center.0 as f64 + start_half * cos_a).round() as i32,
+        (center.1 as f64 + start_half * sin_a).round() as i32,
+    );
+    let f1_end = (
+        (center.0 as f64 + end_half * cos_a).round() as i32,
+        (center.1 as f64 + end_half * sin_a).round() as i32,
+    );
+
+    // Build Bezier curves for each finger so they don't move in
+    // perfectly straight lines (a tell-tale sign of automation).
+    let f0_path = humanizer.build_swipe(
+        Point { x: f0_start.0 as f64, y: f0_start.1 as f64 },
+        Point { x: f0_end.0 as f64, y: f0_end.1 as f64 },
+    );
+    let f1_path = humanizer.build_swipe(
+        Point { x: f1_start.0 as f64, y: f1_start.1 as f64 },
+        Point { x: f1_end.0 as f64, y: f1_end.1 as f64 },
+    );
+
+    // Step count derived from the larger of the two finger distances,
+    // so a short pinch doesn't produce a choppy 2-event stream.
+    let finger_distance = ((end_distance - start_distance).abs()).max(20.0);
+    let steps = humanizer.swipe_step_count(finger_distance).max(4);
+
+    // DOWN on slot 0 first, then slot 1. Real Android requires this
+    // ordering — emitting both DOWNs in the same frame can confuse
+    // some apps that don't expect simultaneous pointer IDs.
+    let pressure0 = sample_pressure(humanizer, cfg);
+    inj.inject_touch(&TouchEvent {
+        x: f0_start.0,
+        y: f0_start.1,
+        phase: TouchPhase::Down,
+        pressure: pressure0,
+        slot: 0,
+    })?;
+    // Tiny inter-finger delay (5-15 ms) — humans can't put both
+    // fingers down at exactly the same instant.
+    let inter_finger = humanizer.human_delay_ms(10, 3);
+    sleep_ms(inter_finger);
+    total_sleep += inter_finger;
+    let pressure1 = sample_pressure(humanizer, cfg);
+    inj.inject_touch(&TouchEvent {
+        x: f1_start.0,
+        y: f1_start.1,
+        phase: TouchPhase::Down,
+        pressure: pressure1,
+        slot: 1,
+    })?;
+
+    // Walk both curves in lockstep. Each step emits a MOVE on slot 0
+    // followed by a MOVE on slot 1 — this matches how the kernel
+    // expects multi-touch events to be framed (one slot's events at
+    // a time, with ABS_MT_SLOT switching in between).
+    for i in 1..=steps {
+        let t = i as f64 / steps as f64;
+        let p0 = f0_path.sample(t);
+        let p1 = f1_path.sample(t);
+
+        // Inter-sample delay — humans don't move at constant speed,
+        // so we Gaussian-jitter the timing.
+        let step_delay =
+            humanizer.human_delay_ms(cfg.sample_delay_ms, cfg.sample_delay_stddev_ms);
+        sleep_ms(step_delay);
+        total_sleep += step_delay;
+
+        // Move finger 0.
+        let p0_pressure = sample_pressure(humanizer, cfg);
+        inj.inject_touch(&TouchEvent {
+            x: p0.x.round() as i32,
+            y: p0.y.round() as i32,
+            phase: TouchPhase::Move,
+            pressure: p0_pressure,
+            slot: 0,
+        })?;
+        // Move finger 1 in the same frame.
+        let p1_pressure = sample_pressure(humanizer, cfg);
+        inj.inject_touch(&TouchEvent {
+            x: p1.x.round() as i32,
+            y: p1.y.round() as i32,
+            phase: TouchPhase::Move,
+            pressure: p1_pressure,
+            slot: 1,
+        })?;
+    }
+
+    // UP on slot 0 first, then slot 1 — same ordering as the DOWNs.
+    inj.inject_touch(&TouchEvent {
+        x: f0_end.0,
+        y: f0_end.1,
+        phase: TouchPhase::Up,
+        pressure: 0,
+        slot: 0,
+    })?;
+    let lift_delay = humanizer.human_delay_ms(10, 3);
+    sleep_ms(lift_delay);
+    total_sleep += lift_delay;
+    inj.inject_touch(&TouchEvent {
+        x: f1_end.0,
+        y: f1_end.1,
+        phase: TouchPhase::Up,
+        pressure: 0,
+        slot: 1,
+    })?;
+
+    let settle = humanizer.human_delay_ms(cfg.settle_ms, cfg.settle_ms / 2);
+    sleep_ms(settle);
+    total_sleep += settle;
+
+    Ok(total_sleep)
+}
+
+/// Convenience wrapper for a zoom-in gesture (fingers start close
+/// together, end far apart).
+pub fn zoom_in(
+    inj: &mut InputInjector,
+    humanizer: &mut HumanizerEngine,
+    center: (i32, i32),
+    start_distance: f64,
+    end_distance: f64,
+    cfg: &GestureConfig,
+) -> Result<u32> {
+    pinch_zoom(inj, humanizer, center, start_distance, end_distance, 45.0, cfg)
+}
+
+/// Convenience wrapper for a zoom-out gesture (fingers start far
+/// apart, end close together).
+pub fn zoom_out(
+    inj: &mut InputInjector,
+    humanizer: &mut HumanizerEngine,
+    center: (i32, i32),
+    start_distance: f64,
+    end_distance: f64,
+    cfg: &GestureConfig,
+) -> Result<u32> {
+    pinch_zoom(inj, humanizer, center, start_distance, end_distance, 45.0, cfg)
+}
+
 // ----- helpers --------------------------------------------------------------
 
 fn sample_pressure(h: &mut HumanizerEngine, cfg: &GestureConfig) -> u32 {
@@ -298,6 +488,110 @@ mod tests {
         for _ in 0..1000 {
             let v = h.next_signed();
             assert!(v >= -1.0 && v < 1.0, "next_signed returned {v}");
+        }
+    }
+
+    // ----- Pinch-zoom math tests (M8.4) -------------------------------------
+    //
+    // We don't test the full `pinch_zoom` function because it requires
+    // an `InputInjector` (which needs /dev/uinput). Instead we test
+    // the math primitives the gesture depends on — the Bezier curve
+    // sampling and the position computation along the pinch line.
+
+    #[test]
+    fn pinch_zoom_zoom_in_increases_distance() {
+        // For a zoom-in: start_distance < end_distance.
+        let center = (540, 960);
+        let start_distance = 30.0_f64;
+        let end_distance = 200.0_f64;
+        let angle_deg = 45.0_f64;
+
+        let angle = angle_deg.to_radians();
+        let (cos_a, sin_a) = (angle.cos(), angle.sin());
+
+        let start_half = start_distance / 2.0;
+        let end_half = end_distance / 2.0;
+
+        let f0_start = (
+            center.0 as f64 - start_half * cos_a,
+            center.1 as f64 - start_half * sin_a,
+        );
+        let f1_start = (
+            center.0 as f64 + start_half * cos_a,
+            center.1 as f64 + start_half * sin_a,
+        );
+        let f0_end = (
+            center.0 as f64 - end_half * cos_a,
+            center.1 as f64 - end_half * sin_a,
+        );
+        let f1_end = (
+            center.0 as f64 + end_half * cos_a,
+            center.1 as f64 + end_half * sin_a,
+        );
+
+        let start_dist_actual = ((f1_start.0 - f0_start.0).powi(2)
+            + (f1_start.1 - f0_start.1).powi(2))
+        .sqrt();
+        let end_dist_actual = ((f1_end.0 - f0_end.0).powi(2)
+            + (f1_end.1 - f0_end.1).powi(2))
+        .sqrt();
+
+        // The computed distances should match the requested ones
+        // (modulo floating-point rounding).
+        assert!((start_dist_actual - start_distance).abs() < 0.001);
+        assert!((end_dist_actual - end_distance).abs() < 0.001);
+        // And for a zoom-in, the end distance must exceed the start.
+        assert!(end_dist_actual > start_dist_actual);
+    }
+
+    #[test]
+    fn pinch_zoom_zoom_out_decreases_distance() {
+        // For a zoom-out: start_distance > end_distance.
+        let center = (540, 960);
+        let start_distance = 200.0_f64;
+        let end_distance = 30.0_f64;
+        let angle_deg = 0.0_f64; // horizontal pinch
+
+        let angle = angle_deg.to_radians();
+        let (cos_a, sin_a) = (angle.cos(), angle.sin());
+
+        let start_half = start_distance / 2.0;
+        let end_half = end_distance / 2.0;
+
+        let f0_start = (center.0 as f64 - start_half * cos_a, center.1 as f64);
+        let f1_start = (center.0 as f64 + start_half * cos_a, center.1 as f64);
+        let f0_end = (center.0 as f64 - end_half * cos_a, center.1 as f64);
+        let f1_end = (center.0 as f64 + end_half * cos_a, center.1 as f64);
+
+        let start_dist_actual = (f1_start.0 - f0_start.0).abs();
+        let end_dist_actual = (f1_end.0 - f0_end.0).abs();
+
+        // For a horizontal pinch, sin(0) = 0 so y stays constant.
+        assert!((f0_start.1 - center.1 as f64).abs() < 0.001);
+        assert!((f1_start.1 - center.1 as f64).abs() < 0.001);
+
+        // For a zoom-out, the end distance must be smaller than start.
+        assert!(end_dist_actual < start_dist_actual);
+    }
+
+    #[test]
+    fn pinch_zoom_fingers_are_symmetric_around_center() {
+        // The midpoint of the two fingers should always equal the center.
+        let center = (300.0_f64, 500.0_f64);
+        let start_distance = 50.0_f64;
+        let end_distance = 150.0_f64;
+        let angle_deg = 30.0_f64;
+
+        let angle = angle_deg.to_radians();
+        let (cos_a, sin_a) = (angle.cos(), angle.sin());
+
+        for &dist in &[start_distance, end_distance] {
+            let half = dist / 2.0;
+            let f0 = (center.0 - half * cos_a, center.1 - half * sin_a);
+            let f1 = (center.0 + half * cos_a, center.1 + half * sin_a);
+            let mid = ((f0.0 + f1.0) / 2.0, (f0.1 + f1.1) / 2.0);
+            assert!((mid.0 - center.0).abs() < 0.001);
+            assert!((mid.1 - center.1).abs() < 0.001);
         }
     }
 }

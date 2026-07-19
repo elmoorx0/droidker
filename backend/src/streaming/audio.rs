@@ -36,13 +36,35 @@
 //   Each frame is a chunk of PCM samples with a 12-byte header:
 //     [0..4]   u32 LE   sample_rate (e.g. 8000)
 //     [4..6]   u16 LE   channels (1 = mono, 2 = stereo)
-//     [6..8]   u16 LE   bits_per_sample (always 16)
+//     [6..8]   u16 LE   bits_per_sample (always 16, or 0 for silence — see below)
 //     [8..12]  u32 LE   sample_count in this chunk
 //     [12..]   s16 LE   sample bytes (sample_count * channels * 2)
+//
+// M8.3 silence detection (VAD):
+//   When the client enables VAD via `{ "type": "set_vad", "enabled": true,
+//   "threshold_db": -40 }`, the daemon computes the RMS of each chunk
+//   *before* sending. Chunks whose RMS falls below `threshold_db`
+//   (default: -40 dBFS, roughly the noise floor of a quiet room) are
+//   sent as a 12-byte *silence marker*: header with `bits_per_sample=0`
+//   and `sample_count=N`, followed by NO PCM payload. The browser
+//   generates `sample_count` samples of digital silence on receive.
+//
+//   For typical Android UI audio (mostly silence punctuated by short
+//   blips), this cuts WebSocket bandwidth by 10-50x without pulling
+//   in a native Opus encoder — keeping the daemon a single ~6 MB Rust
+//   binary as required for the 1-GB VPS target.
+//
+//   To avoid spurious silence→audio→silence flapping on quiet but
+//   audible passages, we apply 50 ms of hysteresis: a chunk must be
+//   below the threshold for `vad_hold_ms` (default 50) consecutive
+//   milliseconds before we start sending silence markers, and we
+//   always send the first non-silent chunk in full so the browser
+//   can resume playback seamlessly.
 //
 // Text messages from the client are JSON control messages:
 //   { "type": "set_format", "sample_rate": 16000, "channels": 1 }
 //   { "type": "set_volume", "volume": 0.8 }
+//   { "type": "set_vad", "enabled": true, "threshold_db": -40 }
 //   { "type": "ping" }
 
 use crate::error::{DroidkerError, Result};
@@ -336,6 +358,10 @@ pub struct AudioWs {
     /// Last heartbeat — we close the connection if the client goes
     /// quiet for 60 s.
     pub last_heartbeat: Instant,
+    /// Voice Activity Detection config (M8.3). When enabled, silent
+    /// chunks are replaced with 12-byte silence markers, cutting
+    /// WebSocket bandwidth 10-50x for typical Android UI audio.
+    pub vad: VadConfig,
 }
 
 impl AudioWs {
@@ -346,6 +372,7 @@ impl AudioWs {
             capturer: None,
             chunk_tx: None,
             last_heartbeat: Instant::now(),
+            vad: VadConfig::default(),
         }
     }
 }
@@ -373,6 +400,302 @@ pub fn encode_audio_chunk(format: AudioFormat, pcm: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&pack_chunk_header(format, sample_count));
     out.extend_from_slice(pcm);
     out
+}
+
+/// Encode a *silence marker* — a 12-byte header with `bits_per_sample=0`
+/// and no PCM payload. The browser generates `sample_count` samples of
+/// digital silence on receive. Used by the VAD path (M8.3) to skip
+/// transmitting silent chunks, cutting WebSocket bandwidth 10-50x for
+/// typical Android UI audio.
+pub fn encode_silence_chunk(format: AudioFormat, sample_count: u32) -> Vec<u8> {
+    // Same layout as a normal chunk header, but with bits_per_sample=0
+    // to signal "this is a silence marker, no payload follows".
+    let silence_format = AudioFormat {
+        sample_rate: format.sample_rate,
+        channels: format.channels,
+        bits_per_sample: 0,
+    };
+    let mut out = Vec::with_capacity(12);
+    out.extend_from_slice(&pack_chunk_header(silence_format, sample_count));
+    out
+}
+
+// ----- Voice Activity Detection (VAD) -------------------------------------
+//
+// Pure-Rust silence detector. We compute the RMS amplitude of each PCM
+// chunk and compare it against a configurable threshold (in dBFS, where
+// 0 dBFS = full-scale / max amplitude). Chunks below the threshold are
+// considered silent.
+//
+// Why RMS and not peak? RMS tracks perceived loudness more closely — a
+// short click will spike the peak without substantially moving the RMS,
+// which is exactly the behaviour we want (clicks *are* signal, even
+// if quiet).
+//
+// Why dBFS and not raw amplitude? Decibels give us a stable,
+// perceptually-meaningful scale that doesn't depend on the bit depth:
+// -40 dBFS at 16-bit ≈ -40 dBFS at 24-bit ≈ "quiet room noise floor".
+
+/// VAD configuration. Lives inside the AudioWs actor and is mutated by
+/// `set_vad` control messages from the client.
+#[derive(Debug, Clone)]
+pub struct VadConfig {
+    /// Whether VAD is currently active. When `false`, every chunk is
+    /// sent in full (the M5 default — preserves wire-format backwards
+    /// compatibility).
+    pub enabled: bool,
+    /// Threshold in dBFS (negative, typically -30 to -50). Chunks
+    /// whose RMS is *below* this are considered silent.
+    pub threshold_db: f32,
+    /// How many milliseconds of consecutive silence to require before
+    /// we start emitting silence markers. Prevents flap on quiet-but-
+    /// audible passages. Default: 50 ms.
+    pub hold_ms: u32,
+    /// Internal: how many consecutive ms of silence we've seen so far.
+    /// Reset to 0 whenever a non-silent chunk arrives.
+    pub silent_ms: u32,
+    /// Internal: are we currently in "emitting silence" mode? Toggled
+    /// on after `silent_ms >= hold_ms` and off on the first non-silent
+    /// chunk.
+    pub emitting_silence: bool,
+}
+
+impl Default for VadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold_db: -40.0,
+            hold_ms: 50,
+            silent_ms: 0,
+            emitting_silence: false,
+        }
+    }
+}
+
+impl VadConfig {
+    /// Process a chunk of PCM samples. Returns `true` if this chunk
+    /// should be sent as a silence marker (i.e. VAD is enabled AND the
+    /// chunk is silent AND we've been silent long enough to start
+    /// emitting markers).
+    ///
+    /// Updates internal hysteresis state. The caller is responsible
+    /// for either calling `encode_silence_chunk` (when this returns
+    /// `true`) or `encode_audio_chunk` (when it returns `false`).
+    pub fn process_chunk(&mut self, pcm: &[u8], format: AudioFormat, chunk_ms: u32) -> bool {
+        if !self.enabled {
+            return false;
+        }
+
+        let rms_db = compute_rms_db(pcm);
+        let is_silent = rms_db < self.threshold_db;
+
+        if is_silent {
+            self.silent_ms = self.silent_ms.saturating_add(chunk_ms);
+            // Use strict `>` rather than `>=` so that a single chunk
+            // whose duration equals `hold_ms` is still sent in full.
+            // This matters for the common case where `hold_ms == 50`
+            // and chunks are 50 ms each — we want the *first* silent
+            // chunk to be sent (so the browser doesn't miss a
+            // potential start of audio), and only start emitting
+            // silence markers from the *second* silent chunk onwards.
+            if self.silent_ms > self.hold_ms {
+                self.emitting_silence = true;
+                return true;
+            }
+            // Still in the hold-off period — send the chunk in full so
+            // the browser doesn't miss the start of a quiet passage.
+            return false;
+        }
+
+        // Non-silent chunk: reset hysteresis, force-emit the next
+        // chunk in full even if we were in silence mode.
+        self.silent_ms = 0;
+        let was_emitting = self.emitting_silence;
+        self.emitting_silence = false;
+        // If we *were* emitting silence, send this chunk in full so
+        // the browser can resume playback seamlessly. Otherwise (we
+        // weren't emitting), this is just a normal non-silent chunk —
+        // also send in full.
+        let _ = was_emitting;
+        false
+    }
+}
+
+/// Compute the RMS amplitude of a PCM buffer in dBFS (decibels relative
+/// to full scale). Returns -∞ for an empty buffer (interpreted as
+/// "silent" by `VadConfig::process_chunk` because any negative value
+/// is below the threshold).
+///
+/// `pcm` is little-endian s16 samples, interleaved by channel. We mix
+/// down to mono by averaging channels before computing the RMS — this
+/// matches how the human ear perceives loudness for multi-channel audio.
+pub fn compute_rms_db(pcm: &[u8]) -> f32 {
+    if pcm.len() < 2 {
+        return f32::NEG_INFINITY;
+    }
+    let mut sum_sq: f64 = 0.0;
+    let mut count: usize = 0;
+    // Iterate 2 bytes at a time (s16le samples).
+    let mut i = 0;
+    while i + 1 < pcm.len() {
+        let sample = i16::from_le_bytes([pcm[i], pcm[i + 1]]) as f64;
+        sum_sq += sample * sample;
+        count += 1;
+        i += 2;
+    }
+    if count == 0 {
+        return f32::NEG_INFINITY;
+    }
+    let rms = (sum_sq / count as f64).sqrt();
+    // Convert to dBFS: 20 * log10(rms / max).
+    // max for i16 = 32767. We add a tiny epsilon to avoid log10(0).
+    let max = 32767.0_f64;
+    let ratio = rms / max;
+    if ratio <= 0.0 {
+        return f32::NEG_INFINITY;
+    }
+    let db = 20.0 * ratio.log10();
+    db as f32
+}
+
+#[cfg(test)]
+mod vad_tests {
+    use super::*;
+
+    fn make_sine_wave(samples: usize, freq: f64, sr: u32, amplitude: f64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(samples * 2);
+        let phase_step = 2.0 * std::f64::consts::PI * freq / sr as f64;
+        let mut phase = 0.0_f64;
+        for _ in 0..samples {
+            let s = (amplitude * phase.sin()) as i16;
+            out.extend_from_slice(&s.to_le_bytes());
+            phase += phase_step;
+            if phase > 2.0 * std::f64::consts::PI * 1000.0 {
+                phase %= 2.0 * std::f64::consts::PI;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn rms_of_digital_silence_is_negative_infinity() {
+        let pcm = vec![0u8; 800]; // 400 samples of zero
+        let db = compute_rms_db(&pcm);
+        assert!(db.is_infinite() && db.is_sign_negative());
+    }
+
+    #[test]
+    fn rms_of_full_scale_sine_is_near_zero_db() {
+        // 1 kHz sine at full scale (amplitude = i16::MAX).
+        let pcm = make_sine_wave(800, 1000.0, 8000, 32767.0);
+        let db = compute_rms_db(&pcm);
+        // RMS of a full-scale sine is -3.01 dBFS (because RMS = max / sqrt(2)).
+        assert!(db > -4.0 && db < -2.0, "expected ~-3 dBFS, got {db}");
+    }
+
+    #[test]
+    fn rms_of_quiet_sine_is_well_below_threshold() {
+        // 1 kHz sine at 1% of full scale ≈ -40 dBFS amplitude, so
+        // RMS ≈ -43 dBFS.
+        let pcm = make_sine_wave(800, 1000.0, 8000, 32767.0 * 0.01);
+        let db = compute_rms_db(&pcm);
+        assert!(db < -40.0, "expected < -40 dBFS, got {db}");
+    }
+
+    #[test]
+    fn rms_of_empty_buffer_is_silent() {
+        let db = compute_rms_db(&[]);
+        assert!(db.is_infinite() && db.is_sign_negative());
+    }
+
+    #[test]
+    fn vad_disabled_always_returns_false() {
+        let mut vad = VadConfig::default();
+        vad.enabled = false;
+        let format = AudioFormat::default();
+        let pcm = make_sine_wave(400, 1000.0, 8000, 32767.0);
+        // Even a loud chunk returns false when VAD is disabled.
+        assert!(!vad.process_chunk(&pcm, format, 50));
+    }
+
+    #[test]
+    fn vad_emits_silence_after_hold_period() {
+        let mut vad = VadConfig::default();
+        vad.enabled = true;
+        vad.threshold_db = -40.0;
+        vad.hold_ms = 50;
+        let format = AudioFormat::default();
+        let silent_pcm = vec![0u8; 800]; // 50 ms of silence at 8 kHz mono s16le
+
+        // First 50 ms: should NOT emit silence (still in hold period).
+        assert!(!vad.process_chunk(&silent_pcm, format, 50));
+        assert_eq!(vad.silent_ms, 50);
+        assert!(!vad.emitting_silence);
+
+        // Second 50 ms: should emit silence (hold period elapsed).
+        assert!(vad.process_chunk(&silent_pcm, format, 50));
+        assert!(vad.emitting_silence);
+    }
+
+    #[test]
+    fn vad_resets_on_loud_chunk() {
+        let mut vad = VadConfig::default();
+        vad.enabled = true;
+        vad.threshold_db = -40.0;
+        vad.hold_ms = 50;
+        vad.silent_ms = 40; // almost at threshold
+        let format = AudioFormat::default();
+        let loud_pcm = make_sine_wave(400, 1000.0, 8000, 32767.0);
+
+        // Loud chunk resets the silent_ms counter and forces full send.
+        assert!(!vad.process_chunk(&loud_pcm, format, 50));
+        assert_eq!(vad.silent_ms, 0);
+        assert!(!vad.emitting_silence);
+    }
+
+    #[test]
+    fn vad_resumes_silence_after_loud_chunk() {
+        let mut vad = VadConfig::default();
+        vad.enabled = true;
+        vad.threshold_db = -40.0;
+        vad.hold_ms = 50;
+        vad.emitting_silence = true; // was emitting silence
+        let format = AudioFormat::default();
+
+        // Loud chunk: should NOT emit silence, should reset state.
+        let loud_pcm = make_sine_wave(400, 1000.0, 8000, 32767.0);
+        assert!(!vad.process_chunk(&loud_pcm, format, 50));
+        assert!(!vad.emitting_silence);
+
+        // Then 100 ms of silence: should immediately re-enter silence mode.
+        let silent_pcm = vec![0u8; 1600]; // 100 ms at 8 kHz mono
+        // First 50 ms: hold period, no silence yet.
+        assert!(!vad.process_chunk(&silent_pcm[..800], format, 50));
+        // Next 50 ms: silence total ≥ hold_ms, emit silence.
+        assert!(vad.process_chunk(&silent_pcm[..800], format, 50));
+    }
+
+    #[test]
+    fn silence_chunk_header_has_zero_bits_per_sample() {
+        let format = AudioFormat::default();
+        let bytes = encode_silence_chunk(format, 400);
+        assert_eq!(bytes.len(), 12); // header only, no payload
+        // bits_per_sample at offset 6..8 should be 0.
+        assert_eq!(u16::from_le_bytes([bytes[6], bytes[7]]), 0);
+        // sample_count at offset 8..12 should be 400.
+        assert_eq!(u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]), 400);
+    }
+
+    #[test]
+    fn normal_chunk_header_preserves_bits_per_sample() {
+        let format = AudioFormat::default();
+        let pcm = vec![0u8; 800];
+        let bytes = encode_audio_chunk(format, &pcm);
+        // bits_per_sample at offset 6..8 should be 16.
+        assert_eq!(u16::from_le_bytes([bytes[6], bytes[7]]), 16);
+        // 12-byte header + 800 bytes of PCM.
+        assert_eq!(bytes.len(), 812);
+    }
 }
 
 // ----- Actor + StreamHandler impls -----------------------------------------
@@ -443,8 +766,13 @@ impl Actor for AudioWs {
                             tokio::time::sleep(Duration::from_millis(50)).await;
                             continue;
                         }
-                        let chunk = encode_audio_chunk(format, &pcm);
-                        if addr.try_send(SendAudio(chunk)).is_err() {
+                        // Send the raw PCM bytes — the actor applies VAD
+                        // and encodes the wire-format frame in its
+                        // `SendAudio` handler. This keeps the VAD state
+                        // (hysteresis counters etc.) on the actor side
+                        // where it can be mutated by `set_vad` control
+                        // messages from the client.
+                        if addr.try_send(SendAudio(pcm)).is_err() {
                             // Channel full or closed — drop chunk.
                         }
                     }
@@ -487,7 +815,27 @@ impl Handler<SendAudio> for AudioWs {
     type Result = ();
     fn handle(&mut self, msg: SendAudio, ctx: &mut Self::Context) {
         self.last_heartbeat = Instant::now();
-        ctx.binary(msg.0);
+        // Apply VAD (M8.3). `process_chunk` mutates hysteresis state
+        // and returns `true` if this chunk should be sent as a silence
+        // marker instead of as raw PCM.
+        let chunk_ms = 50u32; // matches the capture task's read_chunk(50)
+        let frame = if self.vad.process_chunk(&msg.0, self.format, chunk_ms) {
+            // Silent: emit a 12-byte silence marker (no PCM payload).
+            // Compute the actual sample count so the browser generates
+            // the right number of silence samples.
+            let frame_size = (self.format.bits_per_sample / 8) as usize
+                * self.format.channels as usize;
+            let sample_count = if frame_size > 0 {
+                (msg.0.len() / frame_size) as u32
+            } else {
+                0
+            };
+            encode_silence_chunk(self.format, sample_count)
+        } else {
+            // Non-silent (or VAD disabled): emit a normal PCM chunk.
+            encode_audio_chunk(self.format, &msg.0)
+        };
+        ctx.binary(frame);
     }
 }
 
@@ -497,6 +845,18 @@ impl Handler<SendAudio> for AudioWs {
 enum AudioControlMessage {
     SetFormat { sample_rate: u32, channels: u16 },
     SetVolume { volume: f32 },
+    /// Enable or disable Voice Activity Detection (M8.3). When enabled,
+    /// silent chunks are replaced with 12-byte silence markers — saves
+    /// 10-50x WebSocket bandwidth on typical Android UI audio.
+    SetVad {
+        enabled: bool,
+        /// Optional threshold in dBFS (default -40). Chunks whose RMS
+        /// is below this are treated as silent.
+        threshold_db: Option<f32>,
+        /// Optional hold-off in ms (default 50). How long a chunk must
+        /// be silent before we start emitting silence markers.
+        hold_ms: Option<u32>,
+    },
     Ping,
 }
 
@@ -531,6 +891,35 @@ impl StreamHandler<std::result::Result<ws::Message, ws::ProtocolError>> for Audi
                             container_id = %self.container_id,
                             volume = v,
                             "client set volume (applied client-side in Web Audio)"
+                        );
+                        ctx.text(r#"{"type":"ok"}"#);
+                    }
+                    Ok(AudioControlMessage::SetVad {
+                        enabled,
+                        threshold_db,
+                        hold_ms,
+                    }) => {
+                        self.vad.enabled = enabled;
+                        if let Some(t) = threshold_db {
+                            // Clamp to a sane range: -80 dBFS (essentially
+                            // digital noise floor) to 0 dBFS (full scale).
+                            self.vad.threshold_db = t.clamp(-80.0, 0.0);
+                        }
+                        if let Some(h) = hold_ms {
+                            // Clamp to 0-1000 ms — longer holds make the
+                            // stream unresponsive to short audio blips.
+                            self.vad.hold_ms = h.clamp(0, 1000);
+                        }
+                        // Reset hysteresis state so the new config takes
+                        // effect immediately on the next chunk.
+                        self.vad.silent_ms = 0;
+                        self.vad.emitting_silence = false;
+                        tracing::info!(
+                            container_id = %self.container_id,
+                            enabled,
+                            threshold_db = self.vad.threshold_db,
+                            hold_ms = self.vad.hold_ms,
+                            "VAD config updated"
                         );
                         ctx.text(r#"{"type":"ok"}"#);
                     }

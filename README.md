@@ -243,6 +243,35 @@ droidker inspect-apk abc123.apk
 # M7: force a specific translator (e.g. qemu-user when libhoudini crashes)
 droidker run app.apk --arch arm64 --translation-strategy qemu-user
 
+# M8.1: verify an APK's signature before running it
+droidker verify-apk abc123.apk
+# → APK signature info
+#     file:           /var/lib/droidker/apks/abc123.apk
+#     signed:         yes (v2)
+#     cert SHA-256:   ab:cd:ef:01:23:45:67:89:...
+#     cert subject:   CN=Example Inc, O=Example Inc, L=San Francisco
+
+# M8.2: inspect a split-APK bundle (.xapk or .apks)
+droidker upload ~/Downloads/com.example.app.xapk
+droidker inspect-bundle def456.xapk --arch arm64
+# → Split-APK bundle manifest
+#     format:         xapk
+#     package:        com.example.app
+#     version:        1.2.3
+#     available ABIs: arm64_v8a, armeabi_v7a, x86_64
+#     entries:
+#       com.example.app.apk                    base        4521984 bytes
+#       config.arm64_v8a.apk                   abi          819200 bytes (abi=arm64_v8a)
+#       config.en.apk                          locale        16384 bytes (locale=en)
+#       config.xxhdpi.apk                      density      524288 bytes (density=xxhdpi)
+#     recommended install:
+#       • com.example.app.apk
+#       • config.arm64_v8a.apk
+
+# M8.4: pinch-zoom gesture (zoom in at screen center)
+droidker hpinch my-app 270 480 --start-distance 30 --end-distance 200
+# → ✓ humanized pinch zoom-in (270, 480) 30 -> 200 px @ 45° — 487ms total
+
 # Inspect — Target arch + Translation + Strategy override are shown
 droidker inspect my-app
 ```
@@ -313,7 +342,8 @@ cd frontend && npm run build
 | **M5**    | ✅      | Humanizer wiring (Bezier+Gaussian → uinput), /dev/input bind-mount, audio WS, `droidker record` |
 | **M6**    | ✅      | ARM → x86_64 binary translation (libhoudini / libndk_translation / qemu-user), `--arch` flag, `install-translation.sh` |
 | **M7**    | ✅      | APK arch auto-detection (`--arch auto`), per-container `--translation-strategy` override, qemu-user exec wrapper, dashboard TranslationPanel |
-| **M8**    | 🔜     | Opus audio, nsenter screenrecord, pinch-zoom gestures, WebRTC screen option, APK signature verification, split-APK support |
+| **M8**    | ✅      | APK signature verification (`droidker verify-apk`), split-APK bundle support (`.xapk` / `.apks`), audio VAD (10–50× bandwidth savings), multi-touch pinch-zoom gestures (`droidker hpinch`) |
+| **M9**    | 🔜     | Bundle extraction + multi-APK install, Opus audio codec, `nsenter screenrecord` MP4 capture, WebRTC screen option |
 
 ---
 

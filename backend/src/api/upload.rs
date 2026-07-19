@@ -33,10 +33,10 @@ async fn upload_apk(state: web::Data<AppState>, mut payload: Multipart) -> Resul
             .unwrap_or("upload.apk")
             .to_string();
 
-        if !original_name.to_lowercase().ends_with(".apk") {
-            return Err(DroidkerError::InvalidApk(
-                "file must have .apk extension".into(),
-            ));
+        if !is_apk_filename(&original_name) {
+            return Err(DroidkerError::InvalidApk(format!(
+                "file must have .apk, .xapk, or .apks extension (got: {original_name})"
+            )));
         }
 
         // Stream the upload into a temp file while hashing it.
@@ -77,4 +77,12 @@ async fn upload_apk(state: web::Data<AppState>, mut payload: Multipart) -> Resul
     }
 
     Err(DroidkerError::BadRequest("no file field in multipart upload".into()))
+}
+
+/// True if the filename ends with `.apk`, `.xapk`, or `.apks`
+/// (case-insensitive). The latter two are split-APK bundle formats
+/// handled by `apk::bundle` (M8.2).
+fn is_apk_filename(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.ends_with(".apk") || lower.ends_with(".xapk") || lower.ends_with(".apks")
 }

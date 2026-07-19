@@ -57,6 +57,34 @@ enum Cmd {
         apk: String,
     },
 
+    /// Verify an APK's signature (M8.1).
+    ///
+    /// Detects which signature scheme (v1 / v2 / v3 / v3.1) the APK
+    /// uses and extracts the signer certificate SHA-256 fingerprint
+    /// (for v2/v3). Does NOT perform full cryptographic validation —
+    /// only checks that the APK is signed at all and reports the
+    /// signer's cert fingerprint so you can cross-check it against
+    /// an out-of-band source of truth.
+    VerifyApk {
+        /// Filename of an already-uploaded APK (as returned by `upload`).
+        apk: String,
+    },
+
+    /// Inspect a split-APK bundle (.xapk / .apks) (M8.2).
+    ///
+    /// Lists the inner APKs (base + ABI / locale / density splits),
+    /// shows which ABIs the bundle ships splits for, and recommends
+    /// which APKs to install for a given target arch.
+    InspectBundle {
+        /// Filename of an already-uploaded bundle (as returned by `upload`).
+        bundle: String,
+        /// Optional target arch (`arm`, `arm64`, `x86`, `x86_64`).
+        /// When supplied, the response includes a `recommended_install`
+        /// field listing which inner APKs to install.
+        #[arg(long, value_name = "ARCH")]
+        arch: Option<String>,
+    },
+
     /// Create + start a container from an uploaded APK in one step.
     /// Equivalent to `create` + `start`.
     Run {
@@ -221,6 +249,29 @@ enum Cmd {
         hold_ms: u32,
     },
 
+    /// Humanized two-finger pinch-zoom gesture (M8.4).
+    ///
+    /// Sends two fingers down at `start_distance` apart and moves them
+    /// to `end_distance` apart. When `end_distance > start_distance`,
+    /// it's a zoom-in; otherwise zoom-out.
+    Hpinch {
+        id_or_name: String,
+        /// X coordinate of the pinch center.
+        center_x: i32,
+        /// Y coordinate of the pinch center.
+        center_y: i32,
+        /// Initial distance between the two fingers, in pixels.
+        #[arg(long, default_value = "30")]
+        start_distance: f64,
+        /// Final distance between the two fingers, in pixels.
+        #[arg(long, default_value = "200")]
+        end_distance: f64,
+        /// Orientation of the pinch line in degrees (0 = horizontal,
+        /// 90 = vertical, 45 = diagonal — the human default).
+        #[arg(long, default_value = "45")]
+        angle_deg: f64,
+    },
+
     /// Record a container's screen stream to an MJPEG file (M5).
     /// Useful for CI artifacts — drop a recording into your test report
     /// so reviewers can see exactly what the test saw.
@@ -273,6 +324,10 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Ps => commands::ps(&client, output_json).await,
         Cmd::Upload { path } => commands::upload(&client, &path, output_json).await,
         Cmd::InspectApk { apk } => commands::inspect_apk(&client, &apk, output_json).await,
+        Cmd::VerifyApk { apk } => commands::verify_apk(&client, &apk, output_json).await,
+        Cmd::InspectBundle { bundle, arch } => {
+            commands::inspect_bundle(&client, &bundle, arch.as_deref(), output_json).await
+        }
         Cmd::Run {
             apk,
             name,
@@ -351,6 +406,25 @@ async fn main() -> anyhow::Result<()> {
             y,
             hold_ms,
         } => commands::hlongpress(&client, &id_or_name, x, y, hold_ms).await,
+        Cmd::Hpinch {
+            id_or_name,
+            center_x,
+            center_y,
+            start_distance,
+            end_distance,
+            angle_deg,
+        } => {
+            commands::hpinch(
+                &client,
+                &id_or_name,
+                center_x,
+                center_y,
+                start_distance,
+                end_distance,
+                angle_deg,
+            )
+            .await
+        }
         Cmd::Record {
             id_or_name,
             out,

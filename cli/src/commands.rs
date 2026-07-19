@@ -124,6 +124,125 @@ pub async fn inspect_apk(client: &DroidkerClient, apk: &str, json: bool) -> Resu
     Ok(())
 }
 
+/// M8.1: `droidker verify-apk <filename>` — checks an APK's signature.
+pub async fn verify_apk(client: &DroidkerClient, apk: &str, json: bool) -> Result<()> {
+    let result = client.verify_apk(apk).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    println!("{}", "APK signature info".cyan().bold());
+    println!("  file:           {}", result["path"].as_str().unwrap_or("-"));
+    let signed = result["signed"].as_bool().unwrap_or(false);
+    let scheme = result["scheme"].as_str().unwrap_or("none");
+    if signed {
+        println!("  signed:         {} ({})", "yes".green(), scheme);
+    } else {
+        println!("  signed:         {}", "NO".red().bold());
+    }
+    if let Some(fp) = result["cert_sha256"].as_str() {
+        println!("  cert SHA-256:   {}", fp.cyan());
+    }
+    if let Some(subject) = result["cert_subject"].as_str() {
+        println!("  cert subject:   {}", subject);
+    }
+    if !signed {
+        println!();
+        println!(
+            "{}",
+            "WARNING: this APK is unsigned. Running untrusted APKs is a security risk —"
+                .yellow()
+        );
+        println!(
+            "{}",
+            "any code in the APK can execute on your VPS with the container's privileges."
+                .yellow()
+        );
+    }
+    Ok(())
+}
+
+/// M8.2: `droidker inspect-bundle <filename>` — lists an .xapk/.apks bundle's splits.
+pub async fn inspect_bundle(
+    client: &DroidkerClient,
+    bundle: &str,
+    arch: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let result = client.inspect_bundle(bundle, arch).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    let format = result["format"].as_str().unwrap_or("?");
+    println!("{}", "Split-APK bundle manifest".cyan().bold());
+    println!("  file:           {}", result["path"].as_str().unwrap_or("-"));
+    println!("  format:         {}", format);
+    if let Some(pkg) = result["package"].as_str() {
+        println!("  package:        {}", pkg);
+    }
+    if let Some(ver) = result["version_name"].as_str() {
+        println!("  version:        {}", ver);
+    }
+    println!(
+        "  zip entries:    {}",
+        result["zip_entry_count"].as_u64().unwrap_or(0)
+    );
+
+    if let Some(abis) = result["available_abis"].as_array() {
+        if !abis.is_empty() {
+            let abi_strs: Vec<String> = abis
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            println!("  available ABIs: {}", abi_strs.join(", "));
+        }
+    }
+
+    if let Some(entries) = result["entries"].as_array() {
+        println!();
+        println!("  entries:");
+        for entry in entries {
+            let zip_path = entry["zip_path"].as_str().unwrap_or("-");
+            let kind = entry["kind"].as_str().unwrap_or("other");
+            let size = entry["uncompressed_size"].as_u64().unwrap_or(0);
+            let mut detail = String::new();
+            if let Some(abi) = entry["abi"].as_str() {
+                detail.push_str(&format!("abi={}", abi));
+            }
+            if let Some(loc) = entry["locale"].as_str() {
+                if !detail.is_empty() {
+                    detail.push_str(", ");
+                }
+                detail.push_str(&format!("locale={}", loc));
+            }
+            if let Some(d) = entry["density"].as_str() {
+                if !detail.is_empty() {
+                    detail.push_str(", ");
+                }
+                detail.push_str(&format!("density={}", d));
+            }
+            if detail.is_empty() {
+                detail.push('-');
+            }
+            println!("    {:<40} {:<10} {:>10} bytes  ({})", zip_path, kind, size, detail);
+        }
+    }
+
+    if let Some(rec) = result["recommended_install"].as_array() {
+        if !rec.is_empty() {
+            println!();
+            println!("  recommended install:");
+            for r in rec {
+                if let Some(s) = r.as_str() {
+                    println!("    • {}", s.green());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn run(
     client: &DroidkerClient,
     apk: &Path,
@@ -581,6 +700,50 @@ pub async fn hlongpress(
         x,
         y,
         hold_ms,
+        dur
+    );
+    Ok(())
+}
+
+/// Humanized pinch-zoom gesture (M8.4).
+///
+/// Sends a two-finger pinch from `start_distance` to `end_distance`
+/// at the given center point. When `end_distance > start_distance`,
+/// it's a zoom-in; otherwise zoom-out.
+pub async fn hpinch(
+    client: &DroidkerClient,
+    id_or_name: &str,
+    center_x: i32,
+    center_y: i32,
+    start_distance: f64,
+    end_distance: f64,
+    angle_deg: f64,
+) -> Result<()> {
+    let resp = client
+        .human_pinch(
+            id_or_name,
+            center_x,
+            center_y,
+            start_distance,
+            end_distance,
+            angle_deg,
+        )
+        .await?;
+    let dur = resp.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+    let direction = if end_distance > start_distance {
+        "zoom-in"
+    } else {
+        "zoom-out"
+    };
+    println!(
+        "{} humanized pinch {} ({}, {}) {} -> {} px @ {:.0}° — {}ms total",
+        "✓".green(),
+        direction,
+        center_x,
+        center_y,
+        start_distance,
+        end_distance,
+        angle_deg,
         dur
     );
     Ok(())

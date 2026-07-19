@@ -124,6 +124,11 @@ pub enum ApkInspectionError {
     TruncatedEntry(u64),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// Generic catch-all for malformed APK structures that don't fit any
+    /// of the more specific variants (e.g. a corrupt APK Signing Block
+    /// with an impossibly large size header). Used by `apk::verify`.
+    #[error("internal APK parse error: {0}")]
+    Internal(String),
 }
 
 impl From<ApkInspectionError> for DroidkerError {
@@ -138,8 +143,9 @@ const EOCD_SIGNATURE: u32 = 0x06054b50;
 const CD_HEADER_SIGNATURE: u32 = 0x02014b50;
 /// Max size of the EOCD comment field per PKZIP spec.
 const EOCD_COMMENT_MAX: usize = 0xFFFF;
-/// Total size of the fixed EOCD record (without the comment).
-const EOCD_FIXED_SIZE: usize = 22;
+/// Total size of the fixed EOCD record (without the comment). Public so
+/// that `apk::verify` can use it to gate the minimum-APK-size check.
+pub const EOCD_FIXED_SIZE: usize = 22;
 /// Total size of the fixed central-directory header (without name/extra/comment).
 const CD_FIXED_SIZE: usize = 46;
 
@@ -165,7 +171,7 @@ pub fn inspect_apk<P: AsRef<Path>>(apk_path: P) -> std::result::Result<InspectRe
     }
 
     // --- 1. Find the EOCD record by scanning backwards from EOF -----------
-    let eocd = find_eocd(&mut file, file_len)?;
+    let eocd = find_eocd_internal(&mut file, file_len)?;
 
     // --- 2. Read the central directory ------------------------------------
     let cd_offset = eocd.cd_offset;
@@ -302,15 +308,28 @@ fn map_abi_to_arch_token(abi: &str) -> String {
     }
 }
 
-struct EocdRecord {
-    cd_offset: u64,
-    cd_size: u32,
+/// Parsed End-of-Central-Directory record. Public so that `apk::verify`
+/// can read the central-directory offset when locating the APK Signing
+/// Block (which sits immediately before the central directory).
+pub struct EocdRecord {
+    /// Byte offset of the central directory in the file.
+    pub cd_offset: u64,
+    /// Size of the central directory in bytes.
+    pub cd_size: u32,
 }
 
 /// Find the EOCD record by scanning the last 65 KB of the file for the
 /// signature. Per spec, the EOCD can be preceded by up to 64 KB of
 /// archive comment, plus the 22-byte EOCD itself.
-fn find_eocd(file: &mut std::fs::File, file_len: u64) -> std::result::Result<EocdRecord, ApkInspectionError> {
+///
+/// Public so that `apk::verify` can reuse it without duplicating the
+/// backwards-scan logic — both modules need to find the EOCD before they
+/// can locate the central directory (inspect) or the APK Signing Block
+/// (verify).
+pub fn find_eocd_internal(
+    file: &mut std::fs::File,
+    file_len: u64,
+) -> std::result::Result<EocdRecord, ApkInspectionError> {
     let scan_size = std::cmp::min(file_len as usize, EOCD_COMMENT_MAX + EOCD_FIXED_SIZE);
     file.seek(SeekFrom::End(-(scan_size as i64)))?;
     let mut tail = vec![0u8; scan_size];

@@ -41,6 +41,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .service(screen_human_tap)
             .service(screen_human_swipe)
             .service(screen_human_longpress)
+            .service(screen_human_pinch)
             .service(audio_ws),
     );
 }
@@ -231,6 +232,31 @@ pub struct HumanLongPressRequest {
     pub config: Option<GestureConfig>,
 }
 
+/// Request body for `POST /screen/human/pinch` (M8.4).
+#[derive(Debug, Deserialize)]
+pub struct HumanPinchRequest {
+    /// X coordinate of the pinch center.
+    pub center_x: i32,
+    /// Y coordinate of the pinch center.
+    pub center_y: i32,
+    /// Initial distance between the two fingers, in pixels. Typical
+    /// zoom-in starting distance: 30 px (fingers close together).
+    pub start_distance: f64,
+    /// Final distance between the two fingers, in pixels. For a zoom-in
+    /// this is larger than `start_distance`; for a zoom-out, smaller.
+    pub end_distance: f64,
+    /// Orientation of the pinch line in degrees. 0° = horizontal,
+    /// 90° = vertical, 45° = diagonal (the human default).
+    #[serde(default = "default_pinch_angle")]
+    pub angle_deg: f64,
+    #[serde(default)]
+    pub config: Option<GestureConfig>,
+}
+
+fn default_pinch_angle() -> f64 {
+    45.0
+}
+
 /// Generic response from any humanized gesture endpoint.
 #[derive(Debug, Serialize)]
 pub struct HumanGestureResponse {
@@ -333,6 +359,53 @@ async fn screen_human_longpress(
     Ok(HttpResponse::Ok().json(HumanGestureResponse {
         container_id: id.to_string(),
         gesture: "longpress",
+        duration_ms,
+    }))
+}
+
+/// POST /api/v1/containers/{id}/screen/human/pinch
+///
+/// Performs a two-finger pinch-zoom gesture (M8.4). The two fingers
+/// start at `start_distance` apart and end at `end_distance` apart,
+/// oriented along `angle_deg` (0° = horizontal, 90° = vertical,
+/// 45° = diagonal which is the human default).
+///
+/// When `end_distance > start_distance`, the gesture is a zoom-in.
+/// When `end_distance < start_distance`, it's a zoom-out. Both
+/// directions use the same endpoint — the direction is implicit in
+/// the relationship between the two distances.
+#[post("/{id}/screen/human/pinch")]
+async fn screen_human_pinch(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<HumanPinchRequest>,
+) -> Result<impl Responder> {
+    let key = path.into_inner();
+    let id = resolve_id(&state, &key)?;
+    let req = body.into_inner();
+    let cfg = req.config.unwrap_or_default();
+
+    let injector = get_or_create_injector(&state, id).await?;
+    let inj_arc = injector.clone();
+    let duration_ms = tokio::task::spawn_blocking(move || -> Result<u32> {
+        let mut inj = inj_arc.blocking_lock();
+        let mut h = HumanizerEngine::new(seed_for(id));
+        humanizer::pinch_zoom(
+            &mut inj,
+            &mut h,
+            (req.center_x, req.center_y),
+            req.start_distance,
+            req.end_distance,
+            req.angle_deg,
+            &cfg,
+        )
+    })
+    .await
+    .map_err(|e| DroidkerError::Syscall(format!("gesture task join: {e}")))??;
+
+    Ok(HttpResponse::Ok().json(HumanGestureResponse {
+        container_id: id.to_string(),
+        gesture: "pinch",
         duration_ms,
     }))
 }

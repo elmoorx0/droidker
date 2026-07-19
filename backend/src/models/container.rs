@@ -178,9 +178,11 @@ pub struct CreateContainerRequest {
 pub struct HumanizeAction {
     /// What kind of action to perform.
     pub action: HumanizeActionKind,
-    /// X coordinate (0..width) for taps/swipes.
+    /// X coordinate (0..width) for taps/swipes. For pinch-zoom gestures
+    /// this is the X of the gesture's center point.
     pub x: Option<i32>,
-    /// Y coordinate (0..height) for taps/swipes.
+    /// Y coordinate (0..height) for taps/swipes. For pinch-zoom gestures
+    /// this is the Y of the gesture's center point.
     pub y: Option<i32>,
     /// End X for swipe gestures.
     pub x2: Option<i32>,
@@ -190,6 +192,17 @@ pub struct HumanizeAction {
     pub text: Option<String>,
     /// Duration in ms for swipe gestures.
     pub duration_ms: Option<u32>,
+    /// Initial distance between the two fingers for pinch-zoom gestures
+    /// (M8.4). Defaults to 30 px (fingers close together) when omitted.
+    pub start_distance: Option<f64>,
+    /// Final distance between the two fingers for pinch-zoom gestures
+    /// (M8.4). Defaults to 200 px (zoom-in) or 30 px (zoom-out) when
+    /// omitted, depending on the action.
+    pub end_distance: Option<f64>,
+    /// Orientation of the pinch line in degrees (M8.4). 0° = horizontal,
+    /// 90° = vertical, 45° = diagonal (the human-default). Defaults to
+    /// 45° when omitted.
+    pub angle_deg: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -203,4 +216,13 @@ pub enum HumanizeActionKind {
     Home,
     Back,
     Recent,
+    /// Two-finger pinch gesture (M8.4). Use `start_distance`,
+    /// `end_distance`, and `angle_deg` to control the gesture. When
+    /// `end_distance > start_distance`, it's a zoom-in; otherwise
+    /// zoom-out.
+    PinchZoom,
+    /// Convenience alias for `PinchZoom` with `end_distance > start_distance`.
+    ZoomIn,
+    /// Convenience alias for `PinchZoom` with `end_distance < start_distance`.
+    ZoomOut,
 }
