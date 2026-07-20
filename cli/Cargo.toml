@@ -30,6 +30,12 @@ colored = "2.1"
 # stream, grab the first frame, then disconnect.
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 
+# `bytes::Bytes` for the `droidker mp4` subcommand — reqwest exposes
+# response bodies as `Bytes` so we can write them to disk without an
+# extra copy. Re-uses the `bytes` crate already pulled in transitively
+# by reqwest + tokio-tungstenite.
+bytes = "1.5"
+
 [profile.release]
 opt-level = 3
 lto = true

@@ -64,6 +64,11 @@ clap = { version = "4.5", features = ["derive"] }
 sha2 = "0.10"
 hex = "0.4"
 
+# Pure-Rust deflate decoder used by `apk::bundle::extract_bundle` (M9.1).
+# We use the `rust_backend` feature so no native zlib is pulled in —
+# this keeps the daemon a single self-contained ~6.9 MB binary.
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+
 # JPEG encoder for screen streaming (pure Rust, no native deps).
 # We use the `image` crate only for its pixel-buffer types; the actual
 # JPEG encoding goes through `jpeg-encoder` which is ~2-3x faster than

@@ -91,6 +91,12 @@ pub struct Container {
     /// means "auto-resolve" (the M6 default).
     #[serde(default)]
     pub translation_strategy: Option<String>,
+    /// M9.1: extra split APKs to install alongside the base APK. Each
+    /// entry is a path relative to `<data_dir>/apks/` — typically
+    /// `<bundle_sha>/config.arm64_v8a.apk`. Persisted so subsequent
+    /// `start` calls after a `stop` re-bind-mount the same splits.
+    #[serde(default)]
+    pub extra_apks: Vec<String>,
     /// Creation timestamp.
     pub created_at: DateTime<Utc>,
     /// Last state transition timestamp.
@@ -122,6 +128,10 @@ pub struct ContainerSummary {
     pub translation: Option<String>,
     #[serde(default)]
     pub translation_strategy: Option<String>,
+    /// M9.1: number of extra split APKs attached to this container.
+    /// Zero for plain (non-bundle) containers.
+    #[serde(default)]
+    pub extra_apks_count: usize,
     pub created_at: DateTime<Utc>,
 }
 
@@ -137,6 +147,7 @@ impl From<&Container> for ContainerSummary {
             arch: c.arch.clone(),
             translation: c.translation.clone(),
             translation_strategy: c.translation_strategy.clone(),
+            extra_apks_count: c.extra_apks.len(),
             created_at: c.created_at,
         }
     }
@@ -171,6 +182,16 @@ pub struct CreateContainerRequest {
     /// work fine under qemu-user.
     #[serde(default)]
     pub translation_strategy: Option<String>,
+    /// M9.1: extra split APKs to install alongside the base APK (for
+    /// `.xapk` / `.apks` bundle support). Each entry is a filename
+    /// relative to `<data_dir>/apks/` (NOT a host path) — typically
+    /// `<bundle_sha>/config.arm64_v8a.apk`. The manager resolves these
+    /// to absolute paths before passing them to `droidker-init` via
+    /// `DROIDKER_EXTRA_APKS`.
+    ///
+    /// Empty for plain (non-bundle) APK containers.
+    #[serde(default)]
+    pub extra_apks: Vec<String>,
 }
 
 /// Payload for `POST /containers/{id}/humanize` — drives the Humanizer engine.

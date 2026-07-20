@@ -85,6 +85,57 @@ enum Cmd {
         arch: Option<String>,
     },
 
+    /// Extract + run a split-APK bundle in one shot (M9.1).
+    ///
+    /// Uploads the `.xapk` / `.apks` bundle, inspects its structure to
+    /// find the base APK + ABI splits, extracts the recommended install
+    /// set to `<data_dir>/apks/<bundle_sha>/`, creates a container with
+    /// the base APK as the primary and the splits as `extra_apks`, then
+    /// starts it. Equivalent to running `upload` + `inspect-bundle` +
+    /// `extract` + `create` + `start` manually.
+    RunBundle {
+        /// Path to the `.xapk` or `.apks` bundle file.
+        bundle: PathBuf,
+
+        /// Friendly name for the container.
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Memory limit in MB.
+        #[arg(short = 'm', long)]
+        memory: Option<u32>,
+
+        /// CPU quota (% of one core, 1-100).
+        #[arg(short = 'c', long)]
+        cpu: Option<u32>,
+
+        /// Free-form notes.
+        #[arg(long)]
+        notes: Option<String>,
+
+        /// Publish a host:container TCP port pair. Can be repeated.
+        /// Example: `-p 8080:80 -p 8443:443`.
+        #[arg(short = 'p', long = "port", value_name = "HOST:CONTAINER")]
+        ports: Vec<String>,
+
+        /// Target CPU architecture. Accepted values: `arm`, `arm64`,
+        /// `x86`, `x86_64`, or `auto`. `auto` (the default) picks the
+        /// first available ABI split from the bundle.
+        #[arg(long, value_name = "ARCH")]
+        arch: Option<String>,
+
+        /// Translation strategy override (M7.2). See `droidker run
+        /// --translation-strategy`.
+        #[arg(long, value_name = "STRATEGY")]
+        translation_strategy: Option<String>,
+
+        /// Extra split to install alongside the base + ABI split. Pass
+        /// the ZIP path (as reported by `inspect-bundle`), e.g.
+        /// `config.en.apk` for the English locale split. Can be repeated.
+        #[arg(long = "split", value_name = "ZIP_PATH")]
+        extra_splits: Vec<String>,
+    },
+
     /// Create + start a container from an uploaded APK in one step.
     /// Equivalent to `create` + `start`.
     Run {
@@ -292,6 +343,40 @@ enum Cmd {
         quality: u8,
     },
 
+    /// Capture an MP4 video of the container's screen via Android's
+    /// `screenrecord` binary (M9.2).
+    ///
+    /// Unlike `record` (M5.4) which produces an MJPEG via the WebSocket
+    /// screen stream, this subcommand invokes the real `screenrecord`
+    /// binary inside the container's namespaces — so you get a proper
+    /// H.264 MP4 file with audio + smaller size + better quality.
+    /// Useful for product demos, app store trailers, and CI artifacts
+    /// that need to play in standard video players.
+    Mp4 {
+        id_or_name: String,
+        /// Output file path. Default: <id>-<timestamp>.mp4
+        #[arg(short = 'o', long)]
+        out: Option<PathBuf>,
+        /// Recording duration in seconds. Capped at 180 (the
+        /// `screenrecord` per-file hard limit). Default: 10.
+        #[arg(short = 'd', long, default_value = "10")]
+        duration: u32,
+        /// Video bit rate in bits per second. Default: 4 Mbps.
+        /// Bump to 8 Mbps for game captures with rapid motion.
+        #[arg(short = 'b', long, default_value = "4000000")]
+        bit_rate: u32,
+        /// Capture width in pixels. Default: 540 (qHD).
+        #[arg(long, default_value = "540")]
+        width: u32,
+        /// Capture height in pixels. Default: 960.
+        #[arg(long, default_value = "960")]
+        height: u32,
+        /// Rotate the recording 90 degrees. Useful for portrait apps
+        /// being recorded in landscape orientation.
+        #[arg(long)]
+        rotate: bool,
+    },
+
     /// Run a command inside a running container.
     Exec {
         id_or_name: String,
@@ -328,6 +413,30 @@ async fn main() -> anyhow::Result<()> {
         Cmd::InspectBundle { bundle, arch } => {
             commands::inspect_bundle(&client, &bundle, arch.as_deref(), output_json).await
         }
+        Cmd::RunBundle {
+            bundle,
+            name,
+            memory,
+            cpu,
+            notes,
+            ports,
+            arch,
+            translation_strategy,
+            extra_splits,
+        } => commands::run_bundle(
+            &client,
+            &bundle,
+            name,
+            memory,
+            cpu,
+            notes,
+            &ports,
+            arch,
+            translation_strategy,
+            &extra_splits,
+            output_json,
+        )
+        .await,
         Cmd::Run {
             apk,
             name,
@@ -439,6 +548,27 @@ async fn main() -> anyhow::Result<()> {
                 duration,
                 fps,
                 quality,
+            )
+            .await
+        }
+        Cmd::Mp4 {
+            id_or_name,
+            out,
+            duration,
+            bit_rate,
+            width,
+            height,
+            rotate,
+        } => {
+            commands::mp4(
+                &client,
+                &id_or_name,
+                out.as_deref(),
+                duration,
+                bit_rate,
+                width,
+                height,
+                rotate,
             )
             .await
         }

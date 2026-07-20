@@ -61,6 +61,14 @@ pub struct IsolationSpec {
     /// set up libhoudini / libndk_translation / qemu-user before exec'ing
     /// app_process64.
     pub translation: TranslationPlan,
+    /// M9.1: extra split APKs to install alongside the base APK (for
+    /// `.xapk` / `.apks` bundle support). Each entry is an absolute host
+    /// path to an extracted APK file. droidker-init bind-mounts each one
+    /// into the container's `/data/app/<package>/split_<n>.apk` so ART
+    /// picks them up as split APKs during package scan.
+    ///
+    /// Empty for plain (non-bundle) APK containers.
+    pub extra_apks: Vec<PathBuf>,
 }
 
 /// Result of preparing a sandbox.
@@ -143,6 +151,19 @@ impl Isolator {
         // before exec'ing app_process64.
         for (k, v) in spec.translation.env_vars() {
             cmd.env(k, v);
+        }
+        // M9.1: pass the list of extra split APK paths through as a
+        // `:`-separated env var. droidker-init bind-mounts each one
+        // into /data/app/<package>/split_<n>.apk so ART picks them up
+        // during the package scan. Empty for non-bundle containers.
+        if !spec.extra_apks.is_empty() {
+            let joined = spec
+                .extra_apks
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(":");
+            cmd.env("DROIDKER_EXTRA_APKS", joined);
         }
 
         // Namespace flags. `unshare` accepts them as `-<flag>` short opts.

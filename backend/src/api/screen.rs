@@ -42,7 +42,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .service(screen_human_swipe)
             .service(screen_human_longpress)
             .service(screen_human_pinch)
-            .service(audio_ws),
+            .service(audio_ws)
+            .service(screen_record_mp4),
     );
 }
 
@@ -487,3 +488,210 @@ async fn audio_ws(
 // Note: GestureConfig already derives Deserialize via `serde::Deserialize`
 // imported in gestures.rs. If that import is missing, the build will
 // fail here and we'll fix it.
+
+// ----- M9.2: MP4 screenrecord capture ----------------------------------
+
+/// Body for `POST /api/v1/containers/{id}/screen/record-mp4`.
+///
+/// Runs Android's `screenrecord` binary inside the container's
+/// namespaces via `nsenter` and returns the resulting MP4 bytes as
+/// the response body. The recording is synchronous — the request
+/// blocks until `screenrecord` exits (either because `duration_sec`
+/// elapsed or because `screenrecord` hit its 3-minute hard cap).
+#[derive(Debug, Deserialize)]
+struct RecordMp4Request {
+    /// Recording duration in seconds. Capped at 180 (the Android
+    /// `screenrecord` hard limit per-file). Required.
+    duration_sec: u32,
+    /// Video bit rate in bits per second. Higher = better quality +
+    /// bigger file. Default 4 Mbps is fine for most app demos; bump to
+    /// 8 Mbps for game captures with rapid motion.
+    #[serde(default = "default_bit_rate")]
+    bit_rate: u32,
+    /// Capture width in pixels. Defaults to 540 (qHD), matching the
+    /// screen streamer's resolution. Pass the container's actual
+    /// framebuffer width if you know it (e.g. 1080 for FHD devices).
+    #[serde(default = "default_width")]
+    width: u32,
+    /// Capture height in pixels. Defaults to 960.
+    #[serde(default = "default_height")]
+    height: u32,
+    /// Rotate the recording 90 degrees. Useful for portrait apps being
+    /// recorded in landscape orientation. Default false.
+    #[serde(default)]
+    rotate: bool,
+}
+
+fn default_bit_rate() -> u32 {
+    4_000_000
+}
+fn default_width() -> u32 {
+    540
+}
+fn default_height() -> u32 {
+    960
+}
+
+/// POST /api/v1/containers/{id}/screen/record-mp4  (M9.2)
+///
+/// Captures the container's screen to an MP4 file via Android's
+/// `screenrecord` binary, then streams the file back to the caller.
+///
+/// The recording runs synchronously: this endpoint blocks for
+/// `duration_sec` seconds (or until `screenrecord` exits on its own),
+/// then returns the MP4 bytes as `video/mp4`. The caller (CLI) is
+/// expected to set a long enough HTTP timeout — we bump actix's default
+/// via the request's keep-alive, but if there's a reverse proxy in
+/// front, make sure it allows at least `duration_sec + 5` seconds.
+///
+/// Implementation:
+///   1. Resolve the container's PID.
+///   2. `nsenter --target=PID --pid --mount --ipc --net -- /system/bin/screenrecord
+///       --time-limit N --bit-rate RATE --size WxH [--rotate] /tmp/droidker-rec.mp4`
+///   3. Read the resulting file from the host's view of the container's
+///      overlay upperdir: `<data_dir>/overlays/<id>/upper/tmp/droidker-rec.mp4`.
+///   4. Return the bytes; delete the temp file.
+///
+/// On a 1-vCPU VPS, `screenrecord` at 540x960 + 4 Mbps takes ~50% CPU.
+/// For longer / higher-quality captures, run the daemon on a 2-vCPU box.
+#[post("/{id}/screen/record-mp4")]
+async fn screen_record_mp4(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Json<RecordMp4Request>,
+) -> Result<impl Responder> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let key = path.into_inner();
+    let id = resolve_id(&state, &key)?;
+    let req = body.into_inner();
+
+    // Clamp duration_sec to screenrecord's 3-minute cap.
+    let duration = req.duration_sec.clamp(1, 180);
+    let bit_rate = req.bit_rate.max(1_000_000); // 1 Mbps minimum sanity floor
+    let size = format!("{}x{}", req.width.max(64), req.height.max(64));
+
+    let container = state
+        .manager
+        .get(id)
+        .ok_or_else(|| DroidkerError::NotFound(id.to_string()))?;
+    if container.pid == 0 {
+        return Err(DroidkerError::InvalidState(
+            "container is not running".into(),
+        ));
+    }
+
+    // Pick a unique filename so concurrent recordings don't collide.
+    let rec_filename = format!("droidker-rec-{}.mp4", uuid::Uuid::new_v4());
+    let container_tmp_path = format!("/tmp/{rec_filename}");
+
+    // Build the screenrecord invocation. We nsenter into the container's
+    // PID + mount + IPC + net namespaces so screenrecord sees the same
+    // /system/bin/screenrecord, talks to SurfaceFlinger via binder (IPC ns),
+    // and can resolve /tmp via the merged mount table.
+    let mut cmd = Command::new("nsenter");
+    cmd.arg(format!("--target={}", container.pid))
+        .args(["--pid", "--mount", "--ipc", "--net", "--"])
+        .args(["/system/bin/screenrecord"])
+        .args([
+            "--time-limit",
+            &duration.to_string(),
+            "--bit-rate",
+            &bit_rate.to_string(),
+            "--size",
+            &size,
+        ]);
+    if req.rotate {
+        cmd.arg("--rotate");
+    }
+    cmd.arg(&container_tmp_path);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    tracing::info!(
+        container_id = %id,
+        pid = container.pid,
+        duration_sec = duration,
+        bit_rate,
+        size = %size,
+        rotate = req.rotate,
+        path = %container_tmp_path,
+        "starting screenrecord"
+    );
+
+    // Run synchronously, capped at duration + 10s grace. screenrecord
+    // sometimes hangs for a few seconds after the time limit while it
+    // flushes the encoder.
+    let timeout_dur = std::time::Duration::from_secs((duration + 10) as u64);
+    let outcome = tokio::time::timeout(timeout_dur, cmd.output()).await;
+    let output = match outcome {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return Err(DroidkerError::Internal(format!(
+                "screenrecord spawn failed: {e}"
+            )));
+        }
+        Err(_) => {
+            return Err(DroidkerError::Internal(format!(
+                "screenrecord timed out after {timeout_dur:?}"
+            )));
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(DroidkerError::Internal(format!(
+            "screenrecord exited with status {}: {}",
+            output.status,
+            stderr.trim()
+        )));
+    }
+
+    // Read the resulting MP4 from the host's view of the container's
+    // overlay upperdir. The overlay is mounted as
+    //   lowerdir=<android_rootfs> : upperdir=<data_dir>/overlays/<id>/upper
+    //   workdir=<data_dir>/overlays/<id>/work
+    // so any write to /tmp/<file> inside the container lands in
+    // <data_dir>/overlays/<id>/upper/tmp/<file> on the host.
+    let host_mp4_path = state
+        .settings
+        .data_dir
+        .join("overlays")
+        .join(id.to_string())
+        .join("upper")
+        .join("tmp")
+        .join(&rec_filename);
+
+    let mp4_bytes = tokio::fs::read(&host_mp4_path).await.map_err(|e| {
+        DroidkerError::Internal(format!(
+            "screenrecord completed but MP4 file not found at {}: {e}",
+            host_mp4_path.display()
+        ))
+    })?;
+
+    // Best-effort cleanup of the temp file inside the container.
+    let _ = tokio::fs::remove_file(&host_mp4_path).await;
+
+    tracing::info!(
+        container_id = %id,
+        size_bytes = mp4_bytes.len(),
+        "screenrecord MP4 ready"
+    );
+
+    // Stream the bytes back to the caller with the right content type.
+    Ok(HttpResponse::Ok()
+        .content_type("video/mp4")
+        .append_header(("Content-Length", mp4_bytes.len().to_string()))
+        .append_header((
+            "Content-Disposition",
+            format!(
+                "attachment; filename=\"droidker-{}-{}.mp4\"",
+                id,
+                chrono::Utc::now().timestamp()
+            ),
+        ))
+        .body(mp4_bytes))
+}

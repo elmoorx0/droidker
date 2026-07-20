@@ -81,6 +81,72 @@ impl DroidkerClient {
         self.post_json("/api/v1/apk/bundle", body).await
     }
 
+    /// POST /api/v1/apk/extract — extract inner APKs from a split-APK
+    /// bundle (M9.1).
+    ///
+    /// `bundle` is the filename of an already-uploaded `.xapk` / `.apks`
+    /// bundle. `zip_paths` controls which inner entries to extract; when
+    /// empty, all `.apk` entries are extracted.
+    ///
+    /// Returns `{ out_dir, format, extracted: [...], total_bytes }` where
+    /// each entry in `extracted` has `{ zip_path, filename, sha256, size,
+    /// kind, abi }`. The `filename` field is relative to `<data_dir>/apks/`
+    /// — i.e. `<bundle_sha>/<filename>`.
+    pub async fn extract_bundle(
+        &self,
+        bundle: &str,
+        zip_paths: &[String],
+    ) -> Result<serde_json::Value> {
+        let body = json!({
+            "bundle": bundle,
+            "zip_paths": zip_paths,
+        });
+        self.post_json("/api/v1/apk/extract", body).await
+    }
+
+    /// POST /api/v1/containers/{id}/screen/record-mp4 — capture an MP4
+    /// video of the container's screen via Android's `screenrecord`
+    /// binary (M9.2).
+    ///
+    /// This endpoint blocks synchronously for `duration_sec` seconds
+    /// while `screenrecord` runs inside the container's namespaces.
+    /// Returns the raw MP4 bytes as the response body.
+    ///
+    /// We use a per-request client with a bumped timeout because the
+    /// default 120s client would cut off a 3-minute recording.
+    pub async fn record_mp4(
+        &self,
+        id: &str,
+        duration_sec: u32,
+        bit_rate: u32,
+        width: u32,
+        height: u32,
+        rotate: bool,
+    ) -> Result<bytes::Bytes> {
+        // Build a one-off client with a per-request timeout = duration + 30s
+        // grace. The default client's 120s timeout would cut off a 3-min
+        // recording.
+        let timeout = std::time::Duration::from_secs((duration_sec as u64) + 30);
+        let http = Client::builder()
+            .timeout(timeout)
+            .build()?;
+        let url = format!("{}/api/v1/containers/{}/screen/record-mp4", self.base, id);
+        let body = json!({
+            "duration_sec": duration_sec,
+            "bit_rate": bit_rate,
+            "width": width,
+            "height": height,
+            "rotate": rotate,
+        });
+        let resp = http.post(&url).json(&body).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await?;
+            return Err(anyhow!("HTTP {}: {}", status, text));
+        }
+        Ok(resp.bytes().await?)
+    }
+
     pub async fn start_container(&self, id: &str) -> Result<serde_json::Value> {
         self.post_json(&format!("/api/v1/containers/{}/start", id), serde_json::Value::Null)
             .await

@@ -890,3 +890,334 @@ pub async fn record(
     );
     Ok(())
 }
+
+/// `droidker run-bundle` — extract + create + start a split-APK bundle
+/// container in one shot (M9.1).
+///
+/// Flow:
+///   1. Upload the `.xapk` / `.apks` bundle (dedup'd by SHA-256).
+///   2. Inspect the bundle to enumerate inner APKs + their kinds.
+///   3. Resolve the target arch (auto via the bundle's ABI splits, or
+///      the user's `--arch`).
+///   4. Extract the recommended install set (base + matching ABI split,
+///      plus any extras the user listed via `--split`).
+///   5. Create a container with the base APK as `apk` and the splits as
+///      `extra_apks`.
+///   6. Start the container.
+pub async fn run_bundle(
+    client: &DroidkerClient,
+    bundle: &Path,
+    name: Option<String>,
+    memory: Option<u32>,
+    cpu: Option<u32>,
+    notes: Option<String>,
+    ports: &[String],
+    arch: Option<String>,
+    translation_strategy: Option<String>,
+    extra_splits: &[String],
+    json: bool,
+) -> Result<()> {
+    // Step 1: upload the bundle (the daemon dedups by SHA-256).
+    println!("{} Uploading bundle...", "•".cyan());
+    let upload = client.upload_apk(bundle).await?;
+    let stored = upload["filename"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing filename in upload response"))?
+        .to_string();
+
+    // Step 2: inspect the bundle to enumerate inner APKs + kinds.
+    println!("{} Inspecting bundle structure...", "•".cyan());
+    let inspect = client.inspect_bundle(&stored, None).await?;
+    let entries = inspect["entries"]
+        .as_array()
+        .ok_or_else(|| anyhow!("bundle inspect response missing 'entries' array"))?;
+    let available_abis: Vec<String> = inspect["available_abis"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let package = inspect["package"].as_str().map(|s| s.to_string());
+
+    println!(
+        "{} Bundle has {} APK entries (ABIs: {})",
+        "•".cyan(),
+        entries.len(),
+        if available_abis.is_empty() {
+            "none".to_string()
+        } else {
+            available_abis.join(", ")
+        }
+    );
+
+    // Step 3: resolve the target arch.
+    //   --arch auto  → pick the first available ABI from the bundle
+    //                  (sorted by KNOWN_BUNDLE_ABIS priority).
+    //   --arch <X>   → use X verbatim.
+    //   (no flag)    → None (host native; base APK must contain the libs).
+    let resolved_arch = if let Some(a) = arch.as_deref() {
+        if a.eq_ignore_ascii_case("auto") {
+            if let Some(picked) = available_abis.first() {
+                // Map `arm64_v8a` → `arm64`, `armeabi_v7a` → `arm`, etc.
+                let cli_arch = map_bundle_abi_to_cli(picked);
+                println!("{} Auto-picked arch: {}", "•".cyan(), cli_arch.green());
+                Some(cli_arch)
+            } else {
+                println!(
+                    "{} Bundle has no ABI splits; using host arch",
+                    "•".cyan()
+                );
+                None
+            }
+        } else {
+            Some(a.to_string())
+        }
+    } else {
+        None
+    };
+
+    // Step 4: build the list of zip_paths to extract.
+    //   - Always include the base APK.
+    //   - Include the ABI split matching `resolved_arch` (when one exists).
+    //   - Include any user-supplied `--split <zip_path>` entries.
+    let mut zip_paths: Vec<String> = Vec::new();
+    let mut base_zip_path: Option<String> = None;
+    let mut matching_abi_zip_path: Option<String> = None;
+
+    for entry in entries {
+        let zip_path = entry["zip_path"]
+            .as_str()
+            .ok_or_else(|| anyhow!("bundle entry missing 'zip_path'"))?
+            .to_string();
+        let kind = entry["kind"].as_str().unwrap_or("other");
+        if kind == "base" && base_zip_path.is_none() {
+            base_zip_path = Some(zip_path.clone());
+        }
+        if kind == "abi" {
+            if let Some(wanted) = &resolved_arch {
+                let entry_abi = entry["abi"].as_str().unwrap_or("");
+                let cli_abi = map_bundle_abi_to_cli(entry_abi);
+                if &cli_abi == wanted {
+                    matching_abi_zip_path = Some(zip_path.clone());
+                }
+            }
+        }
+    }
+
+    if let Some(p) = &base_zip_path {
+        zip_paths.push(p.clone());
+    } else {
+        return Err(anyhow!(
+            "bundle has no base APK entry (all entries are splits?)"
+        ));
+    }
+    if let Some(p) = &matching_abi_zip_path {
+        zip_paths.push(p.clone());
+    }
+    for s in extra_splits {
+        if !zip_paths.contains(s) {
+            zip_paths.push(s.clone());
+        }
+    }
+
+    println!(
+        "{} Extracting {} APK(s) from bundle...",
+        "•".cyan(),
+        zip_paths.len()
+    );
+    let extract = client.extract_bundle(&stored, &zip_paths).await?;
+    let extracted = extract["extracted"]
+        .as_array()
+        .ok_or_else(|| anyhow!("extract response missing 'extracted' array"))?;
+
+    // The extraction directory name is the bundle's SHA-256 (added by
+    // the daemon). The daemon returns the absolute out_dir, but we need
+    // paths relative to <data_dir>/apks/ for the create request.
+    let out_dir = extract["out_dir"]
+        .as_str()
+        .ok_or_else(|| anyhow!("extract response missing 'out_dir'"))?;
+    let apks_prefix = "/apks/";
+    let bundle_sha_dir = if let Some(idx) = out_dir.find(apks_prefix) {
+        out_dir[idx + apks_prefix.len()..].to_string()
+    } else {
+        // Fallback: use the last path segment.
+        out_dir
+            .split('/')
+            .next_back()
+            .unwrap_or("")
+            .to_string()
+    };
+
+    // Find the base APK's filename + collect splits' relative paths.
+    let mut base_rel: Option<String> = None;
+    let mut extra_apks_rel: Vec<String> = Vec::new();
+    for entry in extracted {
+        let filename = entry["filename"]
+            .as_str()
+            .ok_or_else(|| anyhow!("extracted entry missing 'filename'"))?
+            .to_string();
+        let rel = format!("{bundle_sha_dir}/{filename}");
+        let kind = entry["kind"].as_str().unwrap_or("other");
+        if kind == "base" {
+            base_rel = Some(rel);
+        } else {
+            extra_apks_rel.push(rel);
+        }
+    }
+    let base_apk_rel = base_rel.ok_or_else(|| anyhow!("no base APK in extracted set"))?;
+
+    println!(
+        "{} Base: {} | Splits: {}",
+        "•".cyan(),
+        base_apk_rel,
+        if extra_apks_rel.is_empty() {
+            "(none)".to_string()
+        } else {
+            extra_apks_rel.join(", ")
+        }
+    );
+
+    // Step 5: create the container with the base APK + extra splits.
+    println!("{} Creating container...", "•".cyan());
+    let port_mappings = parse_ports(ports)?;
+    let body = json!({
+        "name": name,
+        "apk": base_apk_rel,
+        "memory_mb": memory,
+        "cpu_percent": cpu,
+        "notes": notes,
+        "ports": port_mappings,
+        "arch": resolved_arch,
+        "translation_strategy": translation_strategy,
+        "extra_apks": extra_apks_rel,
+    });
+    let container = client.create_container(&body).await?;
+    let id = container["id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing id in create response"))?
+        .to_string();
+
+    // Show the resolved package name if the bundle manifest supplied one.
+    if let Some(pkg) = package {
+        println!("{} Package: {}", "•".cyan(), pkg.green());
+    }
+
+    // Step 6: start it.
+    println!("{} Starting container...", "•".cyan());
+    let started = client.start_container(&id).await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&started)?);
+    } else {
+        fmt::print_container_detail(&started);
+        println!(
+            "\n{} Bundle container {} is running ({} splits installed).",
+            "✓".green(),
+            started["name"].as_str().unwrap_or(&id),
+            extra_apks_rel.len()
+        );
+    }
+    Ok(())
+}
+
+/// Map a bundle-internal ABI segment (`arm64_v8a`, `armeabi_v7a`,
+/// `x86_64`, `x86`) back to the CLI arch token (`arm64`, `arm`,
+/// `x86_64`, `x86`). Used by `run_bundle --arch auto` so the CLI
+/// can pass a clean arch token to `POST /containers`.
+fn map_bundle_abi_to_cli(abi: &str) -> String {
+    match abi {
+        "arm64_v8a" => "arm64".to_string(),
+        "armeabi_v7a" => "arm".to_string(),
+        "x86_64" => "x86_64".to_string(),
+        "x86" => "x86".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// `droidker mp4` — capture an MP4 video via Android's `screenrecord`
+/// binary (M9.2).
+///
+/// Flow:
+///   1. Resolve the container id_or_name to a UUID.
+///   2. POST /containers/{id}/screen/record-mp4 with the duration,
+///      bit_rate, size, and rotate flag.
+///   3. The daemon blocks synchronously while `screenrecord` runs
+///      inside the container's namespaces.
+///   4. Write the response body (raw MP4 bytes) to the output file.
+///
+/// We print a small spinner while waiting so the user knows the
+/// recording is in progress (the request can take up to 3 minutes).
+pub async fn mp4(
+    client: &DroidkerClient,
+    id_or_name: &str,
+    out: Option<&std::path::Path>,
+    duration_sec: u32,
+    bit_rate: u32,
+    width: u32,
+    height: u32,
+    rotate: bool,
+) -> Result<()> {
+    let c = client.get_container(id_or_name).await?;
+    let id = c["id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing id in container response"))?;
+
+    // Clamp duration to screenrecord's 3-minute hard cap.
+    let duration = duration_sec.clamp(1, 180);
+
+    let out_path = match out {
+        Some(p) => p.to_path_buf(),
+        None => std::path::PathBuf::from(format!(
+            "{}-{}.mp4",
+            &id[..8],
+            chrono::Utc::now().timestamp()
+        )),
+    };
+
+    println!(
+        "{} recording MP4 of {} for {}s @ {}bps ({}x{}) -> {}",
+        "•".cyan(),
+        id,
+        duration,
+        bit_rate,
+        width,
+        height,
+        out_path.display()
+    );
+    if rotate {
+        println!("{} rotate=on (90°)", "•".cyan());
+    }
+    println!(
+        "{} this blocks until recording finishes — keep the terminal open",
+        "•".dimmed()
+    );
+
+    let start = std::time::Instant::now();
+    let bytes = client
+        .record_mp4(id, duration, bit_rate, width, height, rotate)
+        .await?;
+    let elapsed = start.elapsed().as_secs();
+
+    std::fs::write(&out_path, &bytes)?;
+    let size_kb = bytes.len() / 1024;
+
+    println!(
+        "{} captured {} KB in {}s -> {}",
+        "✓".green(),
+        size_kb,
+        elapsed,
+        out_path.display()
+    );
+    println!(
+        "{} avg bitrate: {} kbps",
+        "•".dimmed(),
+        if elapsed > 0 {
+            (bytes.len() * 8 / 1000) as u64 / elapsed
+        } else {
+            0
+        }
+    );
+    Ok(())
+}

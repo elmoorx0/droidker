@@ -26,3 +26,10 @@ Thumbs.db
 /var/lib/droidker/
 *.log
 *.pid
+
+# Environment / not part of DroidKer source
+skills/
+upload/
+.env
+.env.local
+worklog.md

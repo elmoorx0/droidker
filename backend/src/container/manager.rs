@@ -134,6 +134,7 @@ impl ContainerManager {
             created_at: now,
             updated_at: now,
             notes: req.notes,
+            extra_apks: req.extra_apks.clone(),
         };
 
         // Persist state
@@ -273,6 +274,12 @@ impl ContainerManager {
             // vars are passed to droidker-init via the environment so it
             // can bind-mount the translator's `.so` files before pivot_root.
             translation: translation_plan,
+            // M9.1: resolve extra_apks (paths relative to <data_dir>/apks/)
+            // to absolute host paths so droidker-init can bind-mount them
+            // into /data/app/<package>/split_<n>.apk. We validate each
+            // path here so a typo fails fast instead of producing a
+            // container that starts but can't find its splits.
+            extra_apks: self.resolve_extra_apks(&snapshot.extra_apks)?,
         };
 
         // Apply namespace + cgroup isolation, returning the new PID.
@@ -468,6 +475,40 @@ impl ContainerManager {
     }
 
     // ----- Persistence --------------------------------------------------------
+    
+    /// M9.1: resolve container.extra_apks (paths relative to
+    /// `<data_dir>/apks/`) to absolute host paths. We validate each path
+    /// to ensure it lives under the apks directory and the file actually
+    /// exists — a typo in a split name shouldn't produce a container that
+    /// starts up but can't find its splits at install time.
+    ///
+    /// Security: we reject any path containing `..` or starting with `/`
+    /// to prevent the caller from bind-mounting arbitrary host files into
+    /// the container's `/data/app/`.
+    fn resolve_extra_apks(&self, extra_apks: &[String]) -> Result<Vec<std::path::PathBuf>> {
+        let mut resolved = Vec::with_capacity(extra_apks.len());
+        let apks_dir = self.settings.data_dir.join("apks");
+        for rel in extra_apks {
+            if rel.is_empty() {
+                continue;
+            }
+            if rel.starts_with('/') || rel.contains("..") {
+                return Err(DroidkerError::BadRequest(format!(
+                    "extra_apk path must be relative and not contain '..': {rel:?}"
+                )));
+            }
+            let abs = apks_dir.join(rel);
+            if !abs.exists() {
+                return Err(DroidkerError::BadRequest(format!(
+                    "extra_apk not found: {} (expected at {})",
+                    rel,
+                    abs.display()
+                )));
+            }
+            resolved.push(abs);
+        }
+        Ok(resolved)
+    }
 
     fn persist_state(&self) -> Result<()> {
         let map = self.containers.read().unwrap();

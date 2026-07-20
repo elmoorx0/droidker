@@ -24,11 +24,19 @@
 // `.apks` format. These are ZIP-of-APKs archives used to ship one base
 // APK plus ABI/locale/density splits. The inspector enumerates the
 // inner APKs and recommends which splits to install for a given arch.
+//
+// M9.1 adds `extract_bundle` to the same module — it actually pulls the
+// inner APKs out of the bundle ZIP (handling both STORED and DEFLATED
+// entries) and writes them to disk under `<data_dir>/apks/<bundle_sha>/`
+// so the container init script can `pm install-multiple` them.
 
 pub mod bundle;
 pub mod inspect;
 pub mod verify;
 
-pub use bundle::{inspect_bundle, BundleEntry, BundleFormat, BundleInspectResult, SplitKind};
+pub use bundle::{
+    extract_bundle, inspect_bundle, BundleEntry, BundleExtractResult, BundleFormat,
+    BundleInspectResult, ExtractedApk, ExtractSpec, SplitKind,
+};
 pub use inspect::{inspect_apk, ApkAbiInfo, ApkInspectionError, InspectResult};
 pub use verify::{verify_signature, ApkSignatureInfo};

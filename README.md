@@ -5,7 +5,7 @@
 > drives them with realistic human-like input.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Milestone](https://img.shields.io/badge/Milestone-7-orange)](https://github.com/elmoorx0/droidker)
+[![Milestone](https://img.shields.io/badge/Milestone-9-orange)](https://github.com/elmoorx0/droidker)
 [![Backend: Rust](https://img.shields.io/badge/Backend-Rust-dea584)](https://www.rust-lang.org/)
 [![Frontend: SvelteKit](https://img.shields.io/badge/Frontend-SvelteKit-ff3e00)](https://kit.svelte.dev/)
 
@@ -272,6 +272,30 @@ droidker inspect-bundle def456.xapk --arch arm64
 droidker hpinch my-app 270 480 --start-distance 30 --end-distance 200
 # → ✓ humanized pinch zoom-in (270, 480) 30 -> 200 px @ 45° — 487ms total
 
+# M9.1: run a split-APK bundle in one shot
+# Extracts the base + matching ABI split (+ any --split extras) from
+# the .xapk / .apks archive and starts a container with all of them.
+droidker run-bundle ~/Downloads/com.example.app.xapk --arch auto --name my-app
+# → • Uploading bundle...
+# → • Inspecting bundle structure...
+# → • Bundle has 4 APK entries (ABIs: arm64_v8a, x86_64)
+# → • Auto-picked arch: arm64
+# → • Extracting 2 APK(s) from bundle...
+# → • Creating container...
+# → • Starting container...
+# → ✓ Bundle container my-app is running (1 splits installed).
+
+# M9.1: include extra splits (locale, density) in the install set
+droidker run-bundle app.xapk --arch arm64 \
+  --split config.en.apk \
+  --split config.xxhdpi.apk
+
+# M9.2: capture an MP4 video via Android's real screenrecord binary
+# (proper H.264 with audio + better compression than MJPEG)
+droidker mp4 my-app --duration 30 --bit-rate 8000000 --rotate
+# → • recording MP4 of abc12345-... for 30s @ 8000000bps (540x960) -> abc12345-1718900000.mp4
+# → ✓ captured 12450 KB in 31s -> abc12345-1718900000.mp4
+
 # Inspect — Target arch + Translation + Strategy override are shown
 droidker inspect my-app
 ```
@@ -343,7 +367,8 @@ cd frontend && npm run build
 | **M6**    | ✅      | ARM → x86_64 binary translation (libhoudini / libndk_translation / qemu-user), `--arch` flag, `install-translation.sh` |
 | **M7**    | ✅      | APK arch auto-detection (`--arch auto`), per-container `--translation-strategy` override, qemu-user exec wrapper, dashboard TranslationPanel |
 | **M8**    | ✅      | APK signature verification (`droidker verify-apk`), split-APK bundle support (`.xapk` / `.apks`), audio VAD (10–50× bandwidth savings), multi-touch pinch-zoom gestures (`droidker hpinch`) |
-| **M9**    | 🔜     | Bundle extraction + multi-APK install, Opus audio codec, `nsenter screenrecord` MP4 capture, WebRTC screen option |
+| **M9**    | ✅      | Bundle extraction + multi-APK install (`droidker run-bundle`), `nsenter screenrecord` MP4 capture (`droidker mp4`) |
+| **M10**   | 🔜     | Opus audio codec, async MP4 capture job API, WebRTC screen option, full APK signature cryptographic validation |
 
 ---
 

@@ -128,6 +128,19 @@ fn run(container_id: &str, package: &str, apk_path: &str, apk_sha: &str) -> Resu
     // ---- 8. Install APK + exec app_process -------------------------------
     install_apk(package, apk_path, apk_sha)?;
 
+    // ---- 8b. M9.1: install extra split APKs (bundle support) -------------
+    // When the container was created from a `.xapk` / `.apks` bundle, the
+    // daemon passes a `:`-separated list of host paths to the extracted
+    // split APKs via `DROIDKER_EXTRA_APKS`. We bind-mount each one into
+    // `/data/app/<package>/split_<n>.apk` so ART's PackageManagerScanner
+    // picks them up as split APKs during the boot scan.
+    //
+    // The naming convention `split_<n>.apk` (zero-indexed) matches what
+    // `pm install-multiple` writes when it splits a base+split install
+    // set, so existing tooling (e.g. `dumpsys package`) reports them
+    // correctly.
+    install_extra_apks(package)?;
+
     // ---- 9. Start logcat capture in the background ----------------------
     // The logcat process drains the Android system log buffer into a file
     // the daemon can tail. We redirect both logcat's own stderr and the
@@ -688,6 +701,78 @@ fn install_apk(package: &str, apk_path: &str, _apk_sha: &str) -> Result<(), Stri
 
     std::fs::copy(apk_src, &dst).map_err(|e| format!("copy apk: {e}"))?;
     tracing::info!(dst = %dst.display(), "APK installed");
+    Ok(())
+}
+
+/// M9.1: install extra split APKs for `.xapk` / `.apks` bundle containers.
+///
+/// The daemon passes a `:`-separated list of host paths via the
+/// `DROIDKER_EXTRA_APKS` env var. Each path points to an extracted split
+/// APK on the host (e.g. `config.arm64_v8a.apk`). We copy each one into
+/// `/data/app/<package>/split_<n>.apk` so ART's package scanner picks
+/// them up as split APKs during the boot scan.
+///
+/// The naming convention `split_<n>.apk` (zero-indexed) matches what
+/// `pm install-multiple` writes when it splits a base+split install
+/// set, so existing tooling (e.g. `dumpsys package <pkg>`) reports the
+/// splits correctly.
+///
+/// When `DROIDKER_EXTRA_APKS` is unset or empty, this is a no-op —
+/// plain (non-bundle) containers go through this path without doing
+/// anything.
+fn install_extra_apks(package: &str) -> Result<(), String> {
+    let raw = match std::env::var("DROIDKER_EXTRA_APKS") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return Ok(()),
+    };
+
+    let dst_dir = Path::new("/data/app").join(package);
+    std::fs::create_dir_all(&dst_dir).map_err(|e| format!("mkdir apk dst for splits: {e}"))?;
+
+    let mut installed = 0usize;
+    for (idx, part) in raw.split(':').enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        let src = Path::new(part);
+        if !src.exists() {
+            // Best-effort: skip missing splits with a warning rather than
+            // failing the whole container start. The base APK may still
+            // work, just without the optional ABI/locale/density resources.
+            tracing::warn!(
+                split = part,
+                index = idx,
+                "extra APK not found on host; skipping"
+            );
+            continue;
+        }
+        let dst = dst_dir.join(format!("split_{idx}.apk"));
+        match std::fs::copy(src, &dst) {
+            Ok(bytes) => {
+                tracing::info!(
+                    src = part,
+                    dst = %dst.display(),
+                    bytes,
+                    "split APK installed"
+                );
+                installed += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    src = part,
+                    dst = %dst.display(),
+                    error = %e,
+                    "failed to install split APK (continuing)"
+                );
+            }
+        }
+    }
+
+    tracing::info!(
+        package,
+        installed,
+        "extra split APKs installation complete"
+    );
     Ok(())
 }
 
